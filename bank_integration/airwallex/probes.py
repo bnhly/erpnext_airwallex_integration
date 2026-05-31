@@ -82,3 +82,19 @@ def probe_deposit(source_id):
     the exact payer-name field path on the live tenant."""
     api = _Deposits(**_client_credentials())
     return api.get_by_id(source_id)
+
+
+@frappe.whitelist()
+def probe_sample_per_source_type(page_size=200):
+    """Return one full financial-transaction object per distinct source_type
+    seen in the most recent page, so we can see what fields (especially
+    ``description``) are already populated without any secondary lookup."""
+    api = FinancialTransactions(**_client_credentials())
+    resp = api.get_list(page_num=0, page_size=int(page_size))
+    items = resp.get("items") or resp.get("data") or []
+    samples = {}
+    for txn in items:
+        source_type = txn.get("source_type")
+        if source_type and source_type not in samples:
+            samples[source_type] = txn
+    return samples
