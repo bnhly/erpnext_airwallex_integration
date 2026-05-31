@@ -262,14 +262,25 @@ def _insert_with_billno_fallback(pi, expense_id):
 
 
 def _build_comment(memo, merchant, card, bcur, bamt, tcur, tamt, posting_date):
-    return (
-        f"Description: {memo}      "
-        f"Supplier: {merchant}         "
-        f"Card: {card}        "
-        f"Trans. Value: {bcur} {_money(bamt)}      "
-        f"Original Currency: {tcur} {_money(tamt)}      "
-        f"Transaction Date: {format_date(posting_date, 'dd/MM/yyyy')}"
-    )
+    """Build the PI remarks string, skipping fields we have no value for.
+
+    Supplier (Airwallex `merchant`) is null on every Spend Expense for
+    this tenant, and Card (CARD_NAME_MAP lookup) is empty until the map
+    is populated for a given card_id. Showing "Supplier:" or "Card:"
+    with nothing after them is noise, so only include them when they
+    actually have a value. Same logic for Original Currency when it
+    matches Trans. Value.
+    """
+    parts = [f"Description: {memo}"]
+    if merchant:
+        parts.append(f"Supplier: {merchant}")
+    if card:
+        parts.append(f"Card: {card}")
+    parts.append(f"Trans. Value: {bcur} {_money(bamt)}")
+    if tcur and (tcur != bcur or _money(tamt) != _money(bamt)):
+        parts.append(f"Original Currency: {tcur} {_money(tamt)}")
+    parts.append(f"Transaction Date: {format_date(posting_date, 'dd/MM/yyyy')}")
+    return "      ".join(parts)
 
 
 # ----------------------------------------------------------------------------
