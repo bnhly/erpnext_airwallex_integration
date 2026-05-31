@@ -50,9 +50,35 @@ class _Transfers(AirwallexBase):
         return self.get(endpoint=f"transfers/{transfer_id}")
 
 
+class _IssuingTransactions(AirwallexBase):
+    def get_by_id(self, transaction_id):
+        return self.get(endpoint=f"issuing/transactions/{transaction_id}")
+
+
+class _Deposits(AirwallexBase):
+    def get_by_id(self, deposit_id):
+        return self.get(endpoint=f"deposits/{deposit_id}")
+
+
 @frappe.whitelist()
 def probe_transfer(source_id):
     """Return the raw ``GET /api/v1/transfers/{id}`` response so we can
     confirm the exact beneficiary field path on the live tenant."""
     api = _Transfers(**_client_credentials())
+    return api.get_by_id(source_id)
+
+
+@frappe.whitelist()
+def probe_issuing_transaction(source_id):
+    """Return the raw ``GET /api/v1/issuing/transactions/{id}`` response so we
+    can confirm the exact merchant-name field path on the live tenant."""
+    api = _IssuingTransactions(**_client_credentials())
+    return api.get_by_id(source_id)
+
+
+@frappe.whitelist()
+def probe_deposit(source_id):
+    """Return the raw ``GET /api/v1/deposits/{id}`` response so we can confirm
+    the exact payer-name field path on the live tenant."""
+    api = _Deposits(**_client_credentials())
     return api.get_by_id(source_id)
