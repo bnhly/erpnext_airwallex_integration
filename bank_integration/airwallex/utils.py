@@ -96,6 +96,15 @@ def _match_card_merchant(txn, expense_index):
     if len(candidates) == 1:
         return candidates[0]["merchant"]
 
+    # Multiple candidates with the same (amount, currency). If they all
+    # carry the same name string, there is no ambiguity to resolve - the
+    # answer is identical whichever expense we pick. This is the common
+    # case for repeated identical card swipes at the same merchant
+    # (e.g. two 99 AUD purchases on the same day).
+    unique_names = {c["merchant"] for c in candidates}
+    if len(unique_names) == 1:
+        return candidates[0]["merchant"]
+
     target_dt = _iso_to_dt(txn.get("settled_at") or txn.get("created_at"))
     if not target_dt:
         return ""
