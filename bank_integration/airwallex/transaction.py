@@ -116,7 +116,9 @@ def sync_client_transactions(client, from_date_iso, to_date_iso, settings):
                     continue
 
                 # Map transaction to client's bank account
-                bank_txn = map_airwallex_to_erpnext(txn, client.bank_account)
+                bank_txn = map_airwallex_to_erpnext(
+                    txn, client.bank_account, client=client, api_url=settings.api_url
+                )
                 bank_txn_doc = frappe.get_doc(bank_txn)
                 bank_txn_doc.insert()
                 bank_txn_doc.submit()

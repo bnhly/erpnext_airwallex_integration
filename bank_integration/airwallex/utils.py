@@ -1,6 +1,41 @@
 import frappe
 from datetime import datetime
 
+from bank_integration.airwallex.api.base_api import AirwallexAPIError
+from bank_integration.airwallex.api.deposits import Deposits
+
+
+def _resolve_beneficiary_name(txn, client, api_url):
+    """Return a counterparty name to populate the Bank Transaction
+    ``bank_party_name`` (labelled "Beneficiary Name") field, or an empty
+    string when no useful name can be resolved.
+
+    Currently only DEPOSIT source_types yield a name: the Deposits API
+    returns ``payer_name`` (the party that sent the money), which is what
+    accountants reconcile against. CARD_PURCHASE / CARD_REFUND would need
+    the Issuing API (disabled on this tenant's client) and the Spend
+    Expenses endpoint uses a different ID space, so no lookup is possible
+    for them today. ADJUSTMENT has no external counterparty.
+    """
+    if txn.get("source_type") != "DEPOSIT":
+        return ""
+    source_id = txn.get("source_id")
+    if not (source_id and client and api_url):
+        return ""
+    try:
+        deposit = Deposits(
+            client_id=client.airwallex_client_id,
+            api_key=client.get_password("airwallex_api_key"),
+            api_url=api_url,
+        ).get_by_id(source_id)
+    except AirwallexAPIError as e:
+        frappe.logger().info(
+            f"Deposit lookup failed for {source_id}: {e.status_code} {str(e.message)[:200]}"
+        )
+        return ""
+    return (deposit.get("payer_name") or "").strip()
+
+
 def map_airwallex_status_to_erpnext(airwallex_status):
     """
     Maps Airwallex transaction status to ERPNext Bank Transaction status.
@@ -19,13 +54,18 @@ def map_airwallex_status_to_erpnext(airwallex_status):
 
     return status_mapping.get(airwallex_status.upper(), "Unreconciled")
 
-def map_airwallex_to_erpnext(txn, bank_account):
+def map_airwallex_to_erpnext(txn, bank_account, client=None, api_url=None):
     """
     Maps an Airwallex transaction to ERPNext Bank Transaction format.
 
     Args:
         txn (dict): Airwallex transaction payload.
         bank_account (str): ERPNext Bank Account name.
+        client: Airwallex Client child-table row (provides credentials for
+            secondary lookups such as the Deposits API). Optional so the
+            test harness can build a mapping without API access.
+        api_url (str): Base Airwallex API URL. Required together with
+            ``client`` for the beneficiary lookup to run.
 
     Returns:
         dict: ERPNext Bank Transaction dictionary.
@@ -66,6 +106,7 @@ def map_airwallex_to_erpnext(txn, bank_account):
         "currency": txn_currency,
         "description": txn.get("description") or txn.get("source_type", ""),
         "reference_number": txn.get("batch_id", ""),
+        "bank_party_name": _resolve_beneficiary_name(txn, client, api_url),
         "transaction_id": txn.get("id"),
         "transaction_type": txn.get("transaction_type", ""),
         "deposit": amount if is_deposit else 0,
