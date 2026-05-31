@@ -133,11 +133,30 @@ def run_expense_import(from_date=None, to_date=None):
                 title="AirW Expense Import Error",
             )
 
+    # While we are here and the cardholder has presumably filled in
+    # descriptions for the period being imported, sweep matching Bank
+    # Transactions whose reference_number is still empty - they were
+    # created by the Airwallex sync before the expense had data on it.
+    backfill_updated = 0
+    try:
+        from bank_integration.airwallex.backfill import backfill_reference_numbers
+        from frappe.utils import getdate as _getdate
+        bf_from = _getdate(from_date).isoformat() if from_date else _getdate(add_days(_getdate(to_date) if to_date else today(), -30)).isoformat()
+        bf_to = _getdate(to_date).isoformat() if to_date else _getdate(today()).isoformat()
+        bf = backfill_reference_numbers(from_date=bf_from, to_date=bf_to)
+        backfill_updated = (bf or {}).get("updated", 0)
+    except Exception as e:
+        frappe.log_error(
+            message=f"Bank Transaction reference_number backfill failed: {str(e)[:400]}\n{frappe.get_traceback()}",
+            title="AirW Expense Import Backfill Error",
+        )
+
     summary = (
         f"Airwallex expense import complete. "
         f"Scanned {totals['scanned']}, created {totals['created']} draft PIs, "
         f"skipped {totals['duplicate']} already imported, "
-        f"errors {totals['errors']}, attachments {totals['attachments']}."
+        f"errors {totals['errors']}, attachments {totals['attachments']}, "
+        f"bank transaction references backfilled {backfill_updated}."
     )
     bi_log.create_log(summary, status="Error" if totals["errors"] else "Success")
     frappe.db.commit()
