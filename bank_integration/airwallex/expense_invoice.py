@@ -47,9 +47,33 @@ APPROVED_STATUS = ["APPROVED"]
 IMPORT_ATTACHMENTS = True
 
 # card_id (UUID) -> friendly cardholder name. Optional. Unmapped = blank card.
+#
+# Production data lives in site_config.json under the key
+# ``airwallex_card_names`` so PII does not land in this public repo:
+#
+#     "airwallex_card_names": {
+#         "<card_uuid>": "Cardholder Name",
+#         ...
+#     }
+#
+# The site config entries are merged on top of CARD_NAME_MAP at lookup
+# time (via ``_card_name_map``), so anything you do hardcode here still
+# works but the canonical place is site_config.json on each site.
 CARD_NAME_MAP = {
     # "4497a3ce-c610-4630-870a-cbc077766518": "Ben Healy",
 }
+
+
+def _card_name_map():
+    """Return the merged card_id -> cardholder name lookup.
+
+    Hardcoded ``CARD_NAME_MAP`` is the base; entries under the
+    ``airwallex_card_names`` key in site_config.json override and extend
+    it. site_config.json is per-site and not in the repo, which is where
+    PII (names / emails / card UUIDs) belongs.
+    """
+    overrides = frappe.get_conf().get("airwallex_card_names") or {}
+    return {**CARD_NAME_MAP, **overrides}
 
 
 # ----------------------------------------------------------------------------
@@ -167,7 +191,7 @@ def create_draft_invoice(expense):
     expense_id = expense.get("id")
     merchant = (expense.get("merchant") or "").strip()
     memo = (expense.get("description") or merchant or "Airwallex expense").strip()
-    card_name = CARD_NAME_MAP.get(expense.get("card_id"), "")
+    card_name = _card_name_map().get(expense.get("card_id"), "")
 
     billing_currency = (expense.get("billing_currency") or "AUD").upper()
     gross = _to_float(expense.get("billing_amount"))
