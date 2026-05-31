@@ -57,7 +57,17 @@ CARD_NAME_MAP = {
 # ----------------------------------------------------------------------------
 @frappe.whitelist()
 def enqueue_expense_import(from_date=None, to_date=None):
-    """Called by the Bank Integration Setting button. Runs in the background."""
+    """Called by the Purchase Invoice list button. Runs in the background.
+
+    Restricted to users with the Accounts Manager role. The client side
+    also hides the button for other roles, but enforcing here guards
+    against direct /api/method/ calls.
+    """
+    if "Accounts Manager" not in frappe.get_roles():
+        frappe.throw(
+            "Only users with the Accounts Manager role can import Airwallex expenses.",
+            frappe.PermissionError,
+        )
     frappe.enqueue(
         "bank_integration.airwallex.expense_invoice.run_expense_import",
         queue="long",
