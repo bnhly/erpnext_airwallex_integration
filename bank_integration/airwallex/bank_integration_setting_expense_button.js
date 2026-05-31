@@ -52,6 +52,11 @@ frappe.ui.form.on('Bank Integration Setting', {
             }, __('Airwallex'));
         }
 
+        // Refresh fires every time the form re-renders, so drop any
+        // previous listener before re-binding. Without this guard the
+        // single "import complete" event fans out into one msgprint per
+        // accumulated handler.
+        frappe.realtime.off('expense_import_complete');
         frappe.realtime.on('expense_import_complete', function (data) {
             frappe.msgprint({
                 title: __('Airwallex Expense Import'),
