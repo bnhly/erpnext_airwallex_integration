@@ -6,29 +6,42 @@
 // the Purchase Invoice list view, visible only to users with the Accounts
 // Manager role. Replaces the older button that lived on the Bank Integration
 // Setting form.
+//
+// Uses the `refresh` hook (not `onload`) because Frappe re-renders the
+// listview page header on every refresh, which wipes out buttons added in
+// `onload`. A class-based guard prevents the button being added twice.
 
 frappe.listview_settings['Purchase Invoice'] = frappe.listview_settings['Purchase Invoice'] || {};
 
-const _airwallex_prev_onload = frappe.listview_settings['Purchase Invoice'].onload;
+const _airwallex_prev_refresh = frappe.listview_settings['Purchase Invoice'].refresh;
 
-frappe.listview_settings['Purchase Invoice'].onload = function (listview) {
-    if (_airwallex_prev_onload) {
-        try { _airwallex_prev_onload(listview); } catch (_) { /* ignore */ }
+frappe.listview_settings['Purchase Invoice'].refresh = function (listview) {
+    if (_airwallex_prev_refresh) {
+        try { _airwallex_prev_refresh(listview); } catch (_) { /* ignore */ }
     }
 
-    // Role gate. The server side enforces this too in
+    // Role gate. Server side also enforces in
     // bank_integration.airwallex.expense_invoice.enqueue_expense_import.
     if (!frappe.user.has_role('Accounts Manager')) return;
 
-    // Drop any prior binding so the completion event fires once per import.
-    frappe.realtime.off('expense_import_complete');
-    frappe.realtime.on('expense_import_complete', function (data) {
-        frappe.msgprint({
-            title: __('Airwallex Expense Import'),
-            indicator: data.status === 'success' ? 'green' : 'orange',
-            message: data.message
+    // Wire the completion listener exactly once per page session.
+    if (!window._airwallex_expense_listener) {
+        window._airwallex_expense_listener = true;
+        frappe.realtime.off('expense_import_complete');
+        frappe.realtime.on('expense_import_complete', function (data) {
+            frappe.msgprint({
+                title: __('Airwallex Expense Import'),
+                indicator: data.status === 'success' ? 'green' : 'orange',
+                message: data.message
+            });
         });
-    });
+    }
+
+    // Skip if our button is already in the header from a prior refresh.
+    if (listview.page.inner_toolbar
+        && listview.page.inner_toolbar.find('.airwallex-import-btn').length) {
+        return;
+    }
 
     const $btn = listview.page.add_inner_button(__('Import Airwallex Expenses'), function () {
         const d = new frappe.ui.Dialog({
@@ -73,8 +86,7 @@ frappe.listview_settings['Purchase Invoice'].onload = function (listview) {
         d.show();
     });
 
-    // Make the button visually prominent.
     if ($btn && $btn.addClass) {
-        $btn.addClass('btn-primary');
+        $btn.addClass('btn-primary airwallex-import-btn');
     }
 };
