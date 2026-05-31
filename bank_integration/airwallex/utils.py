@@ -3,37 +3,73 @@ from datetime import datetime
 
 from bank_integration.airwallex.api.base_api import AirwallexAPIError
 from bank_integration.airwallex.api.deposits import Deposits
+from bank_integration.airwallex.api.transfers import Transfers
 
 
-def _resolve_beneficiary_name(txn, client, api_url):
-    """Return a counterparty name to populate the Bank Transaction
-    ``bank_party_name`` (labelled "Beneficiary Name") field, or an empty
-    string when no useful name can be resolved.
+def _resolve_party_name(txn, client, api_url):
+    """Return the counterparty name for the transaction, or empty string.
 
-    Currently only DEPOSIT source_types yield a name: the Deposits API
-    returns ``payer_name`` (the party that sent the money), which is what
-    accountants reconcile against. CARD_PURCHASE / CARD_REFUND would need
-    the Issuing API (disabled on this tenant's client) and the Spend
-    Expenses endpoint uses a different ID space, so no lookup is possible
-    for them today. ADJUSTMENT has no external counterparty.
+    Used to populate the Bank Transaction ``reference_number`` field so
+    accountants can match the row to a Payment Entry on a counterparty
+    name rather than on the (mostly null) Airwallex batch_id.
+
+    Lookups by source_type:
+      DEPOSIT  -> GET /api/v1/deposits/{source_id}.payer_name
+      TRANSFER -> GET /api/v1/transfers/{source_id}.beneficiary, falling
+                  back through bank_details.account_name,
+                  digital_wallet.account_name, company_name,
+                  "first_name last_name" in that order.
+    All other source_types (CARD_PURCHASE, CARD_REFUND, ADJUSTMENT, etc.)
+    have no usable counterparty lookup so the function returns "".
     """
-    if txn.get("source_type") != "DEPOSIT":
-        return ""
+    source_type = txn.get("source_type")
     source_id = txn.get("source_id")
     if not (source_id and client and api_url):
         return ""
-    try:
-        deposit = Deposits(
-            client_id=client.airwallex_client_id,
-            api_key=client.get_password("airwallex_api_key"),
-            api_url=api_url,
-        ).get_by_id(source_id)
-    except AirwallexAPIError as e:
-        frappe.logger().info(
-            f"Deposit lookup failed for {source_id}: {e.status_code} {str(e.message)[:200]}"
-        )
+
+    if source_type == "DEPOSIT":
+        try:
+            deposit = Deposits(
+                client_id=client.airwallex_client_id,
+                api_key=client.get_password("airwallex_api_key"),
+                api_url=api_url,
+            ).get_by_id(source_id)
+        except AirwallexAPIError as e:
+            frappe.logger().info(
+                f"Deposit lookup failed for {source_id}: {e.status_code} {str(e.message)[:200]}"
+            )
+            return ""
+        return (deposit.get("payer_name") or "").strip()
+
+    if source_type == "TRANSFER":
+        try:
+            transfer = Transfers(
+                client_id=client.airwallex_client_id,
+                api_key=client.get_password("airwallex_api_key"),
+                api_url=api_url,
+            ).get_by_id(source_id)
+        except AirwallexAPIError as e:
+            frappe.logger().info(
+                f"Transfer lookup failed for {source_id}: {e.status_code} {str(e.message)[:200]}"
+            )
+            return ""
+        beneficiary = transfer.get("beneficiary") or {}
+        bank_details = beneficiary.get("bank_details") or {}
+        digital_wallet = beneficiary.get("digital_wallet") or {}
+        first = (beneficiary.get("first_name") or "").strip()
+        last = (beneficiary.get("last_name") or "").strip()
+        candidates = [
+            bank_details.get("account_name"),
+            digital_wallet.get("account_name"),
+            beneficiary.get("company_name"),
+            f"{first} {last}".strip() if (first or last) else None,
+        ]
+        for value in candidates:
+            if value and value.strip():
+                return value.strip()
         return ""
-    return (deposit.get("payer_name") or "").strip()
+
+    return ""
 
 
 def map_airwallex_status_to_erpnext(airwallex_status):
@@ -105,8 +141,7 @@ def map_airwallex_to_erpnext(txn, bank_account, client=None, api_url=None):
         "bank_account": mapped_bank_account,
         "currency": txn_currency,
         "description": txn.get("description") or txn.get("source_type", ""),
-        "reference_number": txn.get("batch_id", ""),
-        "bank_party_name": _resolve_beneficiary_name(txn, client, api_url),
+        "reference_number": _resolve_party_name(txn, client, api_url) or txn.get("batch_id", ""),
         "transaction_id": txn.get("id"),
         "transaction_type": txn.get("transaction_type", ""),
         "deposit": amount if is_deposit else 0,
