@@ -14,10 +14,15 @@ def build_expense_merchant_index(client, api_url, from_iso, to_iso):
 
     The Issuing Transactions API would be the canonical source of merchant
     info but it is gated on this tenant's client_id (returns 403). The
-    Spend Expense for the same card swipe carries the merchant name and
-    the original card transaction amount + currency + settled_at, which is
-    enough to match by ``(abs(amount), currency)`` with ``settled_at`` as
-    a tiebreaker.
+    Spend Expense for the same card swipe carries the original card
+    transaction amount + currency + settled_at, which is enough to match
+    by ``(abs(amount), currency)`` with ``settled_at`` as a tiebreaker.
+
+    On this tenant the Spend ``merchant`` field arrives null on every
+    row (the payment network isn't passing it through), so we fall back
+    to the user-entered ``description`` (cardholder memo) which is what
+    the team actually uses to identify the spend. Field used for the
+    output is whichever is populated, in that order.
 
     Returns a list of dicts: ``{amount, currency, settled_at, merchant}``.
     Returns ``[]`` on any error or when called without credentials.
@@ -33,7 +38,9 @@ def build_expense_merchant_index(client, api_url, from_iso, to_iso):
         entries = []
         for expense in api.iter_all(from_created_at=from_iso, to_created_at=to_iso):
             merchant = (expense.get("merchant") or "").strip()
-            if not merchant:
+            description = (expense.get("description") or "").strip()
+            name = merchant or description
+            if not name:
                 continue
             ct = expense.get("card_transaction") or {}
             try:
@@ -47,7 +54,7 @@ def build_expense_merchant_index(client, api_url, from_iso, to_iso):
                 "amount": amount,
                 "currency": currency,
                 "settled_at": expense.get("settled_at") or expense.get("created_at") or "",
-                "merchant": merchant,
+                "merchant": name,
             })
         return entries
     except AirwallexAPIError as e:
