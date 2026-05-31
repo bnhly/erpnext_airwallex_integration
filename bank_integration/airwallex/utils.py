@@ -42,20 +42,40 @@ def build_expense_merchant_index(client, api_url, from_iso, to_iso):
             name = merchant or description
             if not name:
                 continue
+            settled_at = expense.get("settled_at") or expense.get("created_at") or ""
+
+            # Foreign-currency card swipes carry two amounts on the
+            # expense: the original transaction value (card_transaction)
+            # and what the wallet was actually charged (billing). The
+            # corresponding financial_transactions row carries whichever
+            # one Airwallex routes through to the ledger - usually the
+            # billing amount, but indexing both is robust and cheap.
+            keys = set()
+
             ct = expense.get("card_transaction") or {}
             try:
-                amount = round(abs(float(ct.get("amount"))), 2)
+                ct_amount = round(abs(float(ct.get("amount"))), 2)
             except (TypeError, ValueError):
-                continue
-            currency = (ct.get("currency") or "").upper()
-            if not (amount and currency):
-                continue
-            entries.append({
-                "amount": amount,
-                "currency": currency,
-                "settled_at": expense.get("settled_at") or expense.get("created_at") or "",
-                "merchant": name,
-            })
+                ct_amount = 0
+            ct_currency = (ct.get("currency") or "").upper()
+            if ct_amount and ct_currency:
+                keys.add((ct_amount, ct_currency))
+
+            try:
+                bill_amount = round(abs(float(expense.get("billing_amount"))), 2)
+            except (TypeError, ValueError):
+                bill_amount = 0
+            bill_currency = (expense.get("billing_currency") or "").upper()
+            if bill_amount and bill_currency:
+                keys.add((bill_amount, bill_currency))
+
+            for amount, currency in keys:
+                entries.append({
+                    "amount": amount,
+                    "currency": currency,
+                    "settled_at": settled_at,
+                    "merchant": name,
+                })
         return entries
     except AirwallexAPIError as e:
         frappe.logger().info(

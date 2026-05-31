@@ -57,6 +57,27 @@ def sync_transactions(from_date, to_date, setting_name):
             except Exception as log_error:
                 frappe.logger().error(f"Failed to create integration log: {str(log_error)}")
 
+    # After every sync, sweep recent Bank Transactions for any that
+    # still have an empty reference_number. Cardholders frequently
+    # review and fill in expense descriptions in Airwallex days after
+    # the underlying card swipe, so the row created by the original
+    # sync misses the data. A wider rolling window than the sync window
+    # catches those late edits.
+    try:
+        from bank_integration.airwallex.backfill import backfill_reference_numbers
+        from frappe.utils import getdate, add_days, today
+        bf_to = getdate(to_date or today())
+        bf_from = add_days(bf_to, -60)
+        backfill_reference_numbers(
+            from_date=bf_from.isoformat(),
+            to_date=bf_to.isoformat(),
+        )
+    except Exception as e:
+        frappe.log_error(
+            message=f"Reference number backfill after sync failed: {str(e)[:400]}",
+            title="AirW Sync Backfill Error",
+        )
+
     # Update final status and last sync date
     settings.update_sync_progress(total_processed, total_processed, "Completed")
     # Update last sync date to current time for successful completion
