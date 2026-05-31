@@ -1,7 +1,7 @@
 import frappe
 from bank_integration.airwallex.api.financial_transactions import FinancialTransactions
 from bank_integration.airwallex.api.base_api import AirwallexAPIError  # Add this import
-from bank_integration.airwallex.utils import map_airwallex_to_erpnext
+from bank_integration.airwallex.utils import map_airwallex_to_erpnext, build_expense_merchant_index
 from bank_integration.bank_integration.doctype.bank_integration_log import bank_integration_log as bi_log
 from datetime import datetime
 import traceback
@@ -88,6 +88,14 @@ def sync_client_transactions(client, from_date_iso, to_date_iso, settings):
             # If the response is paginated or wrapped
             transactions = transactions.get('items', transactions.get('data', []))
 
+        # Pull the Spend Expenses for the same window once, so we can match
+        # CARD_PURCHASE / CARD_REFUND rows to their merchant name without
+        # an API call per row. The Issuing Transactions API would be the
+        # cleaner source but it is gated on this client_id.
+        expense_index = build_expense_merchant_index(
+            client, settings.api_url, from_date_iso, to_date_iso
+        )
+
         for txn in transactions:
             try:
                 transaction_id = txn.get('id')
@@ -117,7 +125,11 @@ def sync_client_transactions(client, from_date_iso, to_date_iso, settings):
 
                 # Map transaction to client's bank account
                 bank_txn = map_airwallex_to_erpnext(
-                    txn, client.bank_account, client=client, api_url=settings.api_url
+                    txn,
+                    client.bank_account,
+                    client=client,
+                    api_url=settings.api_url,
+                    expense_index=expense_index,
                 )
                 bank_txn_doc = frappe.get_doc(bank_txn)
                 bank_txn_doc.insert()

@@ -3,10 +3,112 @@ from datetime import datetime
 
 from bank_integration.airwallex.api.base_api import AirwallexAPIError
 from bank_integration.airwallex.api.deposits import Deposits
+from bank_integration.airwallex.api.expenses import Expenses
 from bank_integration.airwallex.api.transfers import Transfers
 
 
-def _resolve_party_name(txn, client, api_url):
+def build_expense_merchant_index(client, api_url, from_iso, to_iso):
+    """Pull every Spend Expense in the window and return a list of entries
+    we can match CARD_PURCHASE / CARD_REFUND financial transactions
+    against. One API list call per sync, not one per transaction.
+
+    The Issuing Transactions API would be the canonical source of merchant
+    info but it is gated on this tenant's client_id (returns 403). The
+    Spend Expense for the same card swipe carries the merchant name and
+    the original card transaction amount + currency + settled_at, which is
+    enough to match by ``(abs(amount), currency)`` with ``settled_at`` as
+    a tiebreaker.
+
+    Returns a list of dicts: ``{amount, currency, settled_at, merchant}``.
+    Returns ``[]`` on any error or when called without credentials.
+    """
+    if not (client and api_url and from_iso and to_iso):
+        return []
+    try:
+        api = Expenses(
+            client_id=client.airwallex_client_id,
+            api_key=client.get_password("airwallex_api_key"),
+            api_url=api_url,
+        )
+        entries = []
+        for expense in api.iter_all(from_created_at=from_iso, to_created_at=to_iso):
+            merchant = (expense.get("merchant") or "").strip()
+            if not merchant:
+                continue
+            ct = expense.get("card_transaction") or {}
+            try:
+                amount = round(abs(float(ct.get("amount"))), 2)
+            except (TypeError, ValueError):
+                continue
+            currency = (ct.get("currency") or "").upper()
+            if not (amount and currency):
+                continue
+            entries.append({
+                "amount": amount,
+                "currency": currency,
+                "settled_at": expense.get("settled_at") or expense.get("created_at") or "",
+                "merchant": merchant,
+            })
+        return entries
+    except AirwallexAPIError as e:
+        frappe.logger().info(
+            f"Expense list for merchant index failed: {e.status_code} {str(e.message)[:200]}"
+        )
+        return []
+
+
+def _iso_to_dt(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _match_card_merchant(txn, expense_index):
+    """Find the merchant for a CARD_PURCHASE / CARD_REFUND by matching
+    against the expense index built earlier in the sync. Returns the
+    merchant name or empty string when there is no unambiguous match."""
+    if not expense_index:
+        return ""
+    try:
+        target_amount = round(abs(float(txn.get("amount") or txn.get("net") or 0)), 2)
+    except (TypeError, ValueError):
+        return ""
+    target_currency = (txn.get("currency") or "").upper()
+    if not (target_amount and target_currency):
+        return ""
+
+    candidates = [
+        e for e in expense_index
+        if e["amount"] == target_amount and e["currency"] == target_currency
+    ]
+    if not candidates:
+        return ""
+    if len(candidates) == 1:
+        return candidates[0]["merchant"]
+
+    target_dt = _iso_to_dt(txn.get("settled_at") or txn.get("created_at"))
+    if not target_dt:
+        return ""
+    scored = []
+    for e in candidates:
+        e_dt = _iso_to_dt(e["settled_at"])
+        if e_dt:
+            scored.append((abs((e_dt - target_dt).total_seconds()), e["merchant"]))
+    if not scored:
+        return ""
+    scored.sort(key=lambda pair: pair[0])
+    # Require the closest match to be at least twice as close as the
+    # second best, otherwise the result is ambiguous and we leave it
+    # blank rather than guess.
+    if len(scored) > 1 and scored[1][0] > 0 and scored[0][0] / max(scored[1][0], 1) > 0.5:
+        return ""
+    return scored[0][1]
+
+
+def _resolve_party_name(txn, client, api_url, expense_index=None):
     """Return the counterparty name for the transaction, or empty string.
 
     Used to populate the Bank Transaction ``reference_number`` field so
@@ -14,16 +116,20 @@ def _resolve_party_name(txn, client, api_url):
     name rather than on the (mostly null) Airwallex batch_id.
 
     Lookups by source_type:
-      DEPOSIT  -> GET /api/v1/deposits/{source_id}.payer_name
-      TRANSFER -> GET /api/v1/transfers/{source_id}.beneficiary, falling
-                  back through bank_details.account_name,
-                  digital_wallet.account_name, company_name,
-                  "first_name last_name" in that order.
-    All other source_types (CARD_PURCHASE, CARD_REFUND, ADJUSTMENT, etc.)
-    have no usable counterparty lookup so the function returns "".
+      DEPOSIT                       -> GET /api/v1/deposits/{source_id}.payer_name
+      TRANSFER                      -> GET /api/v1/transfers/{source_id}.beneficiary
+      CARD_PURCHASE / CARD_REFUND   -> match against ``expense_index``
+                                       built once per sync from Spend
+                                       Expenses (see
+                                       ``build_expense_merchant_index``).
+    All other source_types return "".
     """
     source_type = txn.get("source_type")
     source_id = txn.get("source_id")
+
+    if source_type in ("CARD_PURCHASE", "CARD_REFUND"):
+        return _match_card_merchant(txn, expense_index)
+
     if not (source_id and client and api_url):
         return ""
 
@@ -90,7 +196,7 @@ def map_airwallex_status_to_erpnext(airwallex_status):
 
     return status_mapping.get(airwallex_status.upper(), "Unreconciled")
 
-def map_airwallex_to_erpnext(txn, bank_account, client=None, api_url=None):
+def map_airwallex_to_erpnext(txn, bank_account, client=None, api_url=None, expense_index=None):
     """
     Maps an Airwallex transaction to ERPNext Bank Transaction format.
 
@@ -98,10 +204,15 @@ def map_airwallex_to_erpnext(txn, bank_account, client=None, api_url=None):
         txn (dict): Airwallex transaction payload.
         bank_account (str): ERPNext Bank Account name.
         client: Airwallex Client child-table row (provides credentials for
-            secondary lookups such as the Deposits API). Optional so the
-            test harness can build a mapping without API access.
+            secondary lookups such as the Deposits and Transfers APIs).
+            Optional so the test harness can build a mapping without API
+            access.
         api_url (str): Base Airwallex API URL. Required together with
-            ``client`` for the beneficiary lookup to run.
+            ``client`` for the counterparty lookups to run.
+        expense_index (list[dict]): Result of
+            ``build_expense_merchant_index`` for the same sync window,
+            used to populate the merchant on CARD_PURCHASE / CARD_REFUND
+            rows. Optional.
 
     Returns:
         dict: ERPNext Bank Transaction dictionary.
@@ -141,7 +252,7 @@ def map_airwallex_to_erpnext(txn, bank_account, client=None, api_url=None):
         "bank_account": mapped_bank_account,
         "currency": txn_currency,
         "description": txn.get("description") or txn.get("source_type", ""),
-        "reference_number": _resolve_party_name(txn, client, api_url) or txn.get("batch_id", ""),
+        "reference_number": _resolve_party_name(txn, client, api_url, expense_index) or txn.get("batch_id", ""),
         "transaction_id": txn.get("id"),
         "transaction_type": txn.get("transaction_type", ""),
         "deposit": amount if is_deposit else 0,
