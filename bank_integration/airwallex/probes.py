@@ -98,3 +98,23 @@ def probe_sample_per_source_type(page_size=200):
         if source_type and source_type not in samples:
             samples[source_type] = txn
     return samples
+
+
+class _Generic(AirwallexBase):
+    def call(self, endpoint, params):
+        return self.get(endpoint=endpoint, params=params)
+
+
+@frappe.whitelist()
+def probe_get(endpoint, **params):
+    """Generic read-only Airwallex GET probe. Lets us hit any endpoint
+    (e.g. ``transfers/<id>``, ``deposits/<id>``, ``spend/expenses/<id>``)
+    from a URL without shipping a new probe function each time.
+
+    Usage:
+        /api/method/bank_integration.airwallex.probes.probe_get?endpoint=deposits/<id>
+        /api/method/bank_integration.airwallex.probes.probe_get?endpoint=financial_transactions&page_size=5
+    """
+    params.pop("cmd", None)  # frappe injects this
+    api = _Generic(**_client_credentials())
+    return api.call(endpoint, params or None)
