@@ -40,6 +40,7 @@ DEFAULT_EXPENSE_ACCOUNT = "5135 - Cost of Goods Sold - TM"   # corrected manuall
 COST_CENTER = "Main - TM"
 WAREHOUSE = "Pakenham - TM"                                   # ignored for non stock items
 AUD_TAX_TEMPLATE = "GST 10% (TM)"
+NON_AUD_TAX_TEMPLATE = "FRE - GST FREE (TM)"
 LETTER_HEAD = "General TM"
 TITLE_PREFIX = "AirW "
 GST_DIVISOR = 1.1
@@ -60,7 +61,7 @@ IMPORT_ATTACHMENTS = True
 # time (via ``_card_name_map``), so anything you do hardcode here still
 # works but the canonical place is site_config.json on each site.
 CARD_NAME_MAP = {
-    # "4497a3ce-c610-4630-870a-cbc077766518": "Ben Healy",
+    # "<card-uuid>": "Cardholder Name",  # (use site_config instead)
 }
 
 
@@ -255,13 +256,16 @@ def create_draft_invoice(expense):
         except Exception:
             pi.conversion_rate = 1
 
-    # Taxes: GST only for AUD. Clear anything set by defaults first.
+    # Taxes: AUD rows get the 10% GST template, everything else gets the
+    # GST Free template so BAS reporting still picks the row up under the
+    # right classification. Clear anything inherited from supplier or item
+    # defaults first.
     pi.set("taxes", [])
-    if is_aud:
-        from erpnext.controllers.accounts_controller import get_taxes_and_charges
-        pi.taxes_and_charges = AUD_TAX_TEMPLATE
-        for row in get_taxes_and_charges("Purchase Taxes and Charges Template", AUD_TAX_TEMPLATE):
-            pi.append("taxes", row)
+    from erpnext.controllers.accounts_controller import get_taxes_and_charges
+    tax_template = AUD_TAX_TEMPLATE if is_aud else NON_AUD_TAX_TEMPLATE
+    pi.taxes_and_charges = tax_template
+    for row in get_taxes_and_charges("Purchase Taxes and Charges Template", tax_template):
+        pi.append("taxes", row)
 
     pi.calculate_taxes_and_totals()
 
