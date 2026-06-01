@@ -139,9 +139,16 @@ def run_expense_import(from_date=None, to_date=None):
     totals = {
         "scanned": 0, "created": 0, "duplicate": 0, "errors": 0,
         "attachments": 0, "skipped_wrong_status": 0, "skipped_by_tag": 0,
+        "deduped_cross_client": 0,
     }
     # Each entry: {expense_id, date, amount, currency, card_name, description}
     skipped_tag_details = []
+    # An Airwallex tenant returns the same Spend Expenses regardless of
+    # which client credential you query with. Multiple Airwallex Client
+    # rows in Bank Integration Setting (usually one per ERPNext bank
+    # account currency) all hit the same Airwallex tenant, so without
+    # this in-run dedup each expense would be processed once per client.
+    seen_expense_ids = set()
 
     for client in settings.airwallex_clients:
         try:
@@ -162,6 +169,16 @@ def run_expense_import(from_date=None, to_date=None):
 
                 if not expense_id:
                     continue
+
+                # Dedup across client iterations - same Airwallex tenant
+                # returns the same expenses regardless of which client
+                # credential queried it. Don't even count it as a duplicate
+                # since it's not a real already-imported case, just same
+                # underlying expense visited twice in one run.
+                if expense_id in seen_expense_ids:
+                    totals["deduped_cross_client"] += 1
+                    continue
+                seen_expense_ids.add(expense_id)
 
                 # Defensive: Airwallex has been known to return rows that
                 # don't strictly match the status filter we sent, especially
@@ -223,6 +240,7 @@ def run_expense_import(from_date=None, to_date=None):
         f"skipped {totals['duplicate']} already imported, "
         f"skipped {totals['skipped_by_tag']} by description tag, "
         f"skipped {totals['skipped_wrong_status']} wrong status, "
+        f"deduped {totals['deduped_cross_client']} cross-client, "
         f"errors {totals['errors']}, attachments {totals['attachments']}."
     )
     bi_log.create_log(log_summary, status="Error" if totals["errors"] else "Success")
@@ -261,6 +279,8 @@ def _build_import_summary_html(totals, skipped_tag_details, from_date, to_date):
         _row("Skipped &mdash; already imported", totals["duplicate"], "text-muted"),
         _row('Skipped &mdash; <code>#no_export</code> tag', totals["skipped_by_tag"], "text-muted"),
         _row("Skipped &mdash; wrong status", totals["skipped_wrong_status"], "text-muted"),
+        _row("Deduped &mdash; same expense across multiple Airwallex Clients",
+             totals["deduped_cross_client"], "text-muted"),
         _row("Errors", totals["errors"], "text-danger" if totals["errors"] else "text-muted"),
         _row("Attachments downloaded", totals["attachments"], "text-muted"),
         _row("Expenses scanned (total)", totals["scanned"], "text-muted"),
