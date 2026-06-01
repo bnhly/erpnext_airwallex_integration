@@ -304,8 +304,12 @@ def link_existing_purchase_invoices(
             continue
         seen_expense_ids.add(expense_id)
 
+        # Match on the swipe day (created_at), not the backend-clearance
+        # day (settled_at). Manual PIs were dated by the cardholder on
+        # the day of the swipe, so created_at is the date the operator
+        # typed into posting_date - that's what we want to align to.
         date_str = _iso_to_local_date(
-            expense.get("settled_at") or expense.get("created_at")
+            expense.get("created_at") or expense.get("settled_at")
         )
         try:
             amount = round(abs(float(expense.get("billing_amount") or 0)), 2)

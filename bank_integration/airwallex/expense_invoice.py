@@ -193,7 +193,7 @@ def run_expense_import(from_date=None, to_date=None):
                     skipped_tag_details.append({
                         "expense_id": expense_id,
                         "date": _iso_to_local_date(
-                            expense.get("settled_at") or expense.get("created_at")
+                            expense.get("created_at") or expense.get("settled_at")
                         ),
                         "amount": expense.get("billing_amount"),
                         "currency": (expense.get("billing_currency") or "").upper(),
@@ -381,8 +381,15 @@ def create_draft_invoice(expense):
     txn_currency = (card_txn.get("currency") or billing_currency).upper()
     txn_amount = _to_float(card_txn.get("amount"), default=gross)
 
+    # Posting date follows the *swipe* day (created_at), not the
+    # backend-clearance day (settled_at). settled_at can be 1-3 days
+    # later for no business-meaningful reason, and aligning the PI to
+    # the actual transaction day matches what the cardholder remembers,
+    # what the bank statement says, and what the receipt is dated.
+    # settled_at stays as a defensive fallback when created_at is somehow
+    # missing.
     posting_date = _iso_to_local_date(
-        expense.get("settled_at") or expense.get("created_at"),
+        expense.get("created_at") or expense.get("settled_at"),
         fallback=today(),
     )
 
