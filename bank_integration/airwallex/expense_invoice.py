@@ -62,6 +62,26 @@ IMPORT_STATUSES = ["AWAITING_APPROVAL"]
 # cardholder fills the missing fields before pulling the expense into
 # ERPNext. Set to False to revert to status-only filtering.
 REQUIRE_COMPLETE_EXPENSE = True
+
+# Per-expense "import disposition" override, sourced from a custom
+# accounting field configured in Airwallex Spend (type=OTHER). The
+# cardholder or approver picks a value when reviewing an expense; any
+# value in IMPORT_DISPOSITION_SKIP triggers the importer to skip that
+# expense. Empty / missing field = import (the default behaviour for
+# expenses created before the custom field existed).
+#
+# Configure the field in Airwallex Spend:
+#   Settings -> Custom Fields -> Add
+#     Name: "ERPNext Import"  (must match IMPORT_DISPOSITION_FIELD_NAME)
+#     Type: dropdown / single select, optional
+#     Values include at least one of the strings in
+#     IMPORT_DISPOSITION_SKIP below, e.g. "Match to PO".
+IMPORT_DISPOSITION_FIELD_NAME = "ERPNext Import"
+IMPORT_DISPOSITION_SKIP = {
+    "Match to PO",
+    "Already in ERPNext",
+    "Do not import",
+}
 IMPORT_ATTACHMENTS = True
 
 # card_id (UUID) -> friendly cardholder name. Optional. Unmapped = blank card.
@@ -134,6 +154,7 @@ def run_expense_import(from_date=None, to_date=None):
     totals = {
         "scanned": 0, "created": 0, "duplicate": 0, "errors": 0,
         "attachments": 0, "skipped_incomplete": 0, "skipped_wrong_status": 0,
+        "skipped_by_disposition": 0,
     }
 
     for client in settings.airwallex_clients:
@@ -166,6 +187,11 @@ def run_expense_import(from_date=None, to_date=None):
 
                 if REQUIRE_COMPLETE_EXPENSE and not _is_complete_expense(expense):
                     totals["skipped_incomplete"] += 1
+                    continue
+
+                disposition = _import_disposition(expense)
+                if disposition in IMPORT_DISPOSITION_SKIP:
+                    totals["skipped_by_disposition"] += 1
                     continue
 
                 if purchase_invoice_exists(expense_id):
@@ -206,6 +232,7 @@ def run_expense_import(from_date=None, to_date=None):
         f"Scanned {totals['scanned']}, created {totals['created']} draft PIs, "
         f"skipped {totals['duplicate']} already imported, "
         f"skipped {totals['skipped_incomplete']} incomplete (no receipt or no description), "
+        f"skipped {totals['skipped_by_disposition']} by ERPNext Import field, "
         f"skipped {totals['skipped_wrong_status']} wrong status, "
         f"errors {totals['errors']}, attachments {totals['attachments']}."
     )
@@ -396,6 +423,28 @@ def _download(url, token):
 # ----------------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------------
+def _import_disposition(expense):
+    """Return the cardholder/approver-set "ERPNext Import" disposition
+    string for an expense, or empty string if the field is not set.
+
+    Searches both the expense-level accounting_field_selections and the
+    per-line_item ones, because Airwallex allows custom fields at either
+    level depending on how the tenant configured the field.
+    """
+    selections = list(expense.get("accounting_field_selections") or [])
+    for line in expense.get("line_items") or []:
+        selections.extend(line.get("accounting_field_selections") or [])
+    for sel in selections:
+        if sel.get("type") != "OTHER":
+            continue
+        if (sel.get("name") or "").strip() != IMPORT_DISPOSITION_FIELD_NAME:
+            continue
+        value = (sel.get("value") or sel.get("value_label") or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _is_complete_expense(expense):
     """An expense is "complete" when the cardholder has both attached a
     receipt and written a description (memo). Airwallex Spend leaves the
