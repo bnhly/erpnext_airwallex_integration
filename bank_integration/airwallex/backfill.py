@@ -25,6 +25,7 @@ from bank_integration.airwallex.expense_invoice import (
     IMPORT_STATUSES,
     SUPPLIER,
     _iso_range as _expense_iso_range,
+    _iso_to_local_date,
 )
 from bank_integration.airwallex.utils import (
     _resolve_party_name,
@@ -234,6 +235,25 @@ def link_existing_purchase_invoices(
         key = (str(pi.posting_date), amount, (pi.currency or "").upper())
         by_key.setdefault(key, []).append(pi)
 
+    # Pre-compute the set of expense_ids already linked to ANY Purchase
+    # Invoice in the window (typically the auto-imported ones, which are
+    # excluded from candidate_pis by the filter above). Used to split
+    # the "no_match" bucket into "already auto-linked elsewhere" vs
+    # "truly no PI exists for this expense yet".
+    already_linked_expense_ids = set()
+    for row in frappe.get_all(
+        "Purchase Invoice",
+        filters={
+            "posting_date": ["between", [from_date, to_date]],
+            "custom_tm_airwallex_expense_id": ["not in", ["", None]],
+            "docstatus": ["<", 2],
+        },
+        fields=["custom_tm_airwallex_expense_id"],
+    ):
+        eid = row.get("custom_tm_airwallex_expense_id")
+        if eid:
+            already_linked_expense_ids.add(eid)
+
     expenses_api = Expenses(
         client_id=client.airwallex_client_id,
         api_key=client.get_password("airwallex_api_key"),
@@ -246,6 +266,10 @@ def link_existing_purchase_invoices(
         "linked": 0,
         "ambiguous": 0,
         "no_match": 0,
+        "no_match_breakdown": {
+            "already_imported_by_auto": 0,
+            "no_pi_exists": 0,
+        },
         "skipped_already_linked": 0,
         "relink_collision": 0,
         "samples": [],
@@ -253,9 +277,18 @@ def link_existing_purchase_invoices(
         "force_relink": force_relink,
     }
 
+    # Cap samples per outcome class so a flood of one type does not
+    # crowd out visibility of rarer outcomes (e.g. ambiguous /
+    # relink_collision are exactly the ones worth seeing).
+    SAMPLE_CAP_PER_OUTCOME = 8
+    per_outcome_count = {}
+
     def _sample(outcome, **kwargs):
-        if len(results["samples"]) < 30:
-            results["samples"].append({"outcome": outcome, **kwargs})
+        used = per_outcome_count.get(outcome, 0)
+        if used >= SAMPLE_CAP_PER_OUTCOME:
+            return
+        per_outcome_count[outcome] = used + 1
+        results["samples"].append({"outcome": outcome, **kwargs})
 
     from frappe.utils import add_days, getdate
 
@@ -271,7 +304,9 @@ def link_existing_purchase_invoices(
             continue
         seen_expense_ids.add(expense_id)
 
-        date_str = (expense.get("settled_at") or expense.get("created_at") or "")[:10]
+        date_str = _iso_to_local_date(
+            expense.get("settled_at") or expense.get("created_at")
+        )
         try:
             amount = round(abs(float(expense.get("billing_amount") or 0)), 2)
         except (TypeError, ValueError):
@@ -296,8 +331,14 @@ def link_existing_purchase_invoices(
 
         if not candidates:
             results["no_match"] += 1
+            if expense_id in already_linked_expense_ids:
+                outcome = "no_match_already_imported_by_auto"
+                results["no_match_breakdown"]["already_imported_by_auto"] += 1
+            else:
+                outcome = "no_match_no_pi_exists"
+                results["no_match_breakdown"]["no_pi_exists"] += 1
             _sample(
-                "no_match",
+                outcome,
                 expense_id=expense_id,
                 date=date_str,
                 amount=amount,

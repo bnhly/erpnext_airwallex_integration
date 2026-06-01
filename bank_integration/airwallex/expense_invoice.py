@@ -192,7 +192,9 @@ def run_expense_import(from_date=None, to_date=None):
                     totals["skipped_by_tag"] += 1
                     skipped_tag_details.append({
                         "expense_id": expense_id,
-                        "date": (expense.get("settled_at") or expense.get("created_at") or "")[:10],
+                        "date": _iso_to_local_date(
+                            expense.get("settled_at") or expense.get("created_at")
+                        ),
                         "amount": expense.get("billing_amount"),
                         "currency": (expense.get("billing_currency") or "").upper(),
                         "card_name": _card_name_map().get(expense.get("card_id"), ""),
@@ -274,17 +276,25 @@ def _build_import_summary_html(totals, skipped_tag_details, from_date, to_date):
             value = f'<span class="{accent}">{value}</span>'
         return f'<tr><th style="width:60%">{label}</th><td class="text-right">{value}</td></tr>'
 
+    # Only surface rows the operator actually cares about. Hidden:
+    #   - "scanned" (raw API count, jargon-y)
+    #   - "deduped_cross_client" (only meaningful if you understand that
+    #     multiple Airwallex Client rows share one tenant - confusing
+    #     for the accounting team)
+    #   - "wrong status" and "errors" unless non-zero (no value in
+    #     showing rows that say "0" by default)
     summary_rows = [
         _row("Created draft Purchase Invoices", totals["created"], "text-success"),
         _row("Skipped &mdash; already imported", totals["duplicate"], "text-muted"),
         _row('Skipped &mdash; <code>#no_export</code> tag', totals["skipped_by_tag"], "text-muted"),
-        _row("Skipped &mdash; wrong status", totals["skipped_wrong_status"], "text-muted"),
-        _row("Deduped &mdash; same expense across multiple Airwallex Clients",
-             totals["deduped_cross_client"], "text-muted"),
-        _row("Errors", totals["errors"], "text-danger" if totals["errors"] else "text-muted"),
         _row("Attachments downloaded", totals["attachments"], "text-muted"),
-        _row("Expenses scanned (total)", totals["scanned"], "text-muted"),
     ]
+    if totals["skipped_wrong_status"]:
+        summary_rows.append(_row(
+            "Skipped &mdash; wrong status", totals["skipped_wrong_status"], "text-muted",
+        ))
+    if totals["errors"]:
+        summary_rows.append(_row("Errors", totals["errors"], "text-danger"))
 
     skipped_section = ""
     if skipped_tag_details:
@@ -371,7 +381,10 @@ def create_draft_invoice(expense):
     txn_currency = (card_txn.get("currency") or billing_currency).upper()
     txn_amount = _to_float(card_txn.get("amount"), default=gross)
 
-    posting_date = (expense.get("settled_at") or expense.get("created_at") or today())[:10]
+    posting_date = _iso_to_local_date(
+        expense.get("settled_at") or expense.get("created_at"),
+        fallback=today(),
+    )
 
     is_aud = billing_currency == "AUD"
     net = round(gross / GST_DIVISOR, 2) if is_aud else round(gross, 2)
@@ -531,6 +544,34 @@ def _download(url, token):
 # ----------------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------------
+def _iso_to_local_date(iso_string, fallback=""):
+    """Convert an Airwallex ISO8601 timestamp to a YYYY-MM-DD string in
+    the site's system timezone.
+
+    Airwallex returns timestamps in UTC (suffix Z or +00:00). For an
+    Australian site a swipe at 1am Melbourne on June 1 has settled_at
+    "2026-05-31T15:00:00Z" - taking the raw [:10] slice incorrectly
+    files the PI under May 31 instead of June 1. This helper does the
+    proper TZ conversion before formatting the date.
+
+    Returns ``fallback`` if input is empty. Falls back to the raw [:10]
+    slice if the timezone lookup fails (preserves previous behaviour).
+    """
+    if not iso_string:
+        return fallback
+    import pytz
+    from datetime import datetime as _dt
+    try:
+        dt = _dt.fromisoformat(str(iso_string).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return str(iso_string)[:10]
+    try:
+        tz = pytz.timezone(frappe.utils.get_system_timezone())
+        return dt.astimezone(tz).strftime("%Y-%m-%d")
+    except Exception:
+        return dt.strftime("%Y-%m-%d")
+
+
 def _description_has_skip_tag(description):
     """Whole-word, case-insensitive check for any of SKIP_DESCRIPTION_TAGS
     in the description string."""
