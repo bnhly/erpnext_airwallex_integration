@@ -3,7 +3,10 @@ Airwallex Spend Expenses -> ERPNext Purchase Invoice (DRAFT) importer.
 
 Behaviour
 - Pulls expenses in the workflow states listed in IMPORT_STATUSES
-  (defaults to AWAITING_APPROVAL i.e. "pending") over a created_at window.
+  (defaults to APPROVED - the approver has acted as a human checkpoint)
+  over a created_at window. Approvers mark per-expense exceptions by
+  appending a SKIP_DESCRIPTION_TAGS token (default ``#no_export``) to
+  the description before approving; those rows are then skipped.
 - Creates one Purchase Invoice per expense, left in DRAFT (not submitted), so
   the GL account can be corrected manually before submission.
 - GST is applied only to AUD expenses. For AUD the item rate is the net amount
@@ -46,13 +49,22 @@ LETTER_HEAD = "General TM"
 TITLE_PREFIX = "AirW "
 GST_DIVISOR = 1.1
 # Airwallex Spend Expense statuses to import. The full enum is DRAFT,
-# AWAITING_APPROVAL, REJECTED, APPROVED, ARCHIVED. "Pending" in the
-# Airwallex workflow is AWAITING_APPROVAL - expenses that the cardholder
-# has submitted but no approver has actioned yet. The importer is
+# AWAITING_APPROVAL, REJECTED, APPROVED, ARCHIVED. APPROVED is the safest
+# state to import from because the approver has acted as a human
+# checkpoint - they only approve expenses that should hit ERPNext, and
+# they can mark exceptions (e.g. PO-bound expenses) with the
+# SKIP_DESCRIPTION_TAGS markers below before approving. The importer is
 # idempotent (custom_tm_airwallex_expense_id is unique) so a row imported
-# at this status stays out of subsequent runs even if it later moves to
-# APPROVED or ARCHIVED in Airwallex.
-IMPORT_STATUSES = ["AWAITING_APPROVAL"]
+# here stays out of subsequent runs.
+IMPORT_STATUSES = ["APPROVED"]
+
+# Tokens that, if present anywhere in the cardholder description, cause
+# the importer to skip the expense. Default to "#no_export" - the
+# approver types or appends this when the expense should not become a
+# draft PI in ERPNext (e.g. a PO already exists for the purchase and the
+# PI will be created from the PO workflow, or it was already entered
+# manually). Match is case-insensitive and whole-word.
+SKIP_DESCRIPTION_TAGS = {"#no_export"}
 
 # Require an expense to be "complete" before importing - has at least one
 # attached receipt AND a non-empty cardholder description. Airwallex Spend
@@ -141,8 +153,9 @@ def enqueue_expense_import(from_date=None, to_date=None):
 
 
 def run_expense_import(from_date=None, to_date=None):
-    """Import expenses in IMPORT_STATUSES (default AWAITING_APPROVAL aka
-    "pending") created within the window into draft PIs."""
+    """Import expenses in IMPORT_STATUSES (default APPROVED) created
+    within the window into draft PIs. Expenses whose description carries
+    a SKIP_DESCRIPTION_TAGS token (default ``#no_export``) are skipped."""
     settings = frappe.get_single("Bank Integration Setting")
 
     if not getattr(settings, "airwallex_clients", None):
@@ -154,7 +167,7 @@ def run_expense_import(from_date=None, to_date=None):
     totals = {
         "scanned": 0, "created": 0, "duplicate": 0, "errors": 0,
         "attachments": 0, "skipped_incomplete": 0, "skipped_wrong_status": 0,
-        "skipped_by_disposition": 0,
+        "skipped_by_disposition": 0, "skipped_by_tag": 0,
     }
 
     for client in settings.airwallex_clients:
@@ -187,6 +200,10 @@ def run_expense_import(from_date=None, to_date=None):
 
                 if REQUIRE_COMPLETE_EXPENSE and not _is_complete_expense(expense):
                     totals["skipped_incomplete"] += 1
+                    continue
+
+                if _description_has_skip_tag(expense.get("description")):
+                    totals["skipped_by_tag"] += 1
                     continue
 
                 disposition = _import_disposition(expense)
@@ -232,6 +249,7 @@ def run_expense_import(from_date=None, to_date=None):
         f"Scanned {totals['scanned']}, created {totals['created']} draft PIs, "
         f"skipped {totals['duplicate']} already imported, "
         f"skipped {totals['skipped_incomplete']} incomplete (no receipt or no description), "
+        f"skipped {totals['skipped_by_tag']} by description tag, "
         f"skipped {totals['skipped_by_disposition']} by ERPNext Import field, "
         f"skipped {totals['skipped_wrong_status']} wrong status, "
         f"errors {totals['errors']}, attachments {totals['attachments']}."
@@ -253,7 +271,8 @@ def create_draft_invoice(expense):
     """Build and insert one draft Purchase Invoice for an expense."""
     expense_id = expense.get("id")
     merchant = (expense.get("merchant") or "").strip()
-    memo = (expense.get("description") or merchant or "Airwallex expense").strip()
+    raw_description = (expense.get("description") or "").strip()
+    memo = (_strip_skip_tags(raw_description) or merchant or "Airwallex expense").strip()
     card_name = _card_name_map().get(expense.get("card_id"), "")
 
     billing_currency = (expense.get("billing_currency") or "AUD").upper()
@@ -443,6 +462,26 @@ def _import_disposition(expense):
         if value:
             return value
     return ""
+
+
+def _description_has_skip_tag(description):
+    """Whole-word, case-insensitive check for any of SKIP_DESCRIPTION_TAGS
+    in the description string."""
+    if not description:
+        return False
+    tokens = {t.lower() for t in description.split()}
+    return any(tag.lower() in tokens for tag in SKIP_DESCRIPTION_TAGS)
+
+
+def _strip_skip_tags(text):
+    """Remove SKIP_DESCRIPTION_TAGS tokens from a string. Used before
+    putting the cardholder memo into the PI so the tag does not leak
+    into bill_no / title / remarks."""
+    if not text:
+        return text
+    skip_lower = {t.lower() for t in SKIP_DESCRIPTION_TAGS}
+    kept = [tok for tok in text.split() if tok.lower() not in skip_lower]
+    return " ".join(kept).strip()
 
 
 def _is_complete_expense(expense):
