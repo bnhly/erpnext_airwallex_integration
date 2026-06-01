@@ -53,6 +53,15 @@ GST_DIVISOR = 1.1
 # at this status stays out of subsequent runs even if it later moves to
 # APPROVED or ARCHIVED in Airwallex.
 IMPORT_STATUSES = ["AWAITING_APPROVAL"]
+
+# Require an expense to be "complete" before importing - has at least one
+# attached receipt AND a non-empty cardholder description. Airwallex Spend
+# leaves an expense in AWAITING_APPROVAL even when these are missing, so
+# the API status filter alone is not enough. The Airwallex dashboard
+# surfaces these as "Incomplete" badges; we want to wait until the
+# cardholder fills the missing fields before pulling the expense into
+# ERPNext. Set to False to revert to status-only filtering.
+REQUIRE_COMPLETE_EXPENSE = True
 IMPORT_ATTACHMENTS = True
 
 # card_id (UUID) -> friendly cardholder name. Optional. Unmapped = blank card.
@@ -122,7 +131,10 @@ def run_expense_import(from_date=None, to_date=None):
 
     from_iso, to_iso = _iso_range(settings, from_date, to_date)
 
-    totals = {"scanned": 0, "created": 0, "duplicate": 0, "errors": 0, "attachments": 0}
+    totals = {
+        "scanned": 0, "created": 0, "duplicate": 0, "errors": 0,
+        "attachments": 0, "skipped_incomplete": 0, "skipped_wrong_status": 0,
+    }
 
     for client in settings.airwallex_clients:
         try:
@@ -142,6 +154,18 @@ def run_expense_import(from_date=None, to_date=None):
                 expense_id = expense.get("id")
 
                 if not expense_id:
+                    continue
+
+                # Defensive: Airwallex has been known to return rows that
+                # don't strictly match the status filter we sent, especially
+                # if they have added a new enum value not in our list. Skip
+                # anything whose status is not what we asked for.
+                if expense.get("status") not in IMPORT_STATUSES:
+                    totals["skipped_wrong_status"] += 1
+                    continue
+
+                if REQUIRE_COMPLETE_EXPENSE and not _is_complete_expense(expense):
+                    totals["skipped_incomplete"] += 1
                     continue
 
                 if purchase_invoice_exists(expense_id):
@@ -181,6 +205,8 @@ def run_expense_import(from_date=None, to_date=None):
         f"Airwallex expense import complete. "
         f"Scanned {totals['scanned']}, created {totals['created']} draft PIs, "
         f"skipped {totals['duplicate']} already imported, "
+        f"skipped {totals['skipped_incomplete']} incomplete (no receipt or no description), "
+        f"skipped {totals['skipped_wrong_status']} wrong status, "
         f"errors {totals['errors']}, attachments {totals['attachments']}."
     )
     bi_log.create_log(summary, status="Error" if totals["errors"] else "Success")
@@ -370,6 +396,20 @@ def _download(url, token):
 # ----------------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------------
+def _is_complete_expense(expense):
+    """An expense is "complete" when the cardholder has both attached a
+    receipt and written a description (memo). Airwallex Spend leaves the
+    status at AWAITING_APPROVAL even when these are missing - the
+    dashboard surfaces it with an "Incomplete" badge - and these are the
+    rows we want to defer until the cardholder fills the missing fields.
+    """
+    if not expense.get("attachments"):
+        return False
+    if not (expense.get("description") or "").strip():
+        return False
+    return True
+
+
 def purchase_invoice_exists(expense_id):
     return bool(frappe.db.exists("Purchase Invoice",
                                  {"custom_tm_airwallex_expense_id": expense_id}))
