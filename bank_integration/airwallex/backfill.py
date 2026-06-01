@@ -267,7 +267,7 @@ def link_existing_purchase_invoices(
         "ambiguous": 0,
         "no_match": 0,
         "no_match_breakdown": {
-            "already_imported_by_auto": 0,
+            "already_linked_elsewhere": 0,
             "no_pi_exists": 0,
         },
         "skipped_already_linked": 0,
@@ -332,8 +332,11 @@ def link_existing_purchase_invoices(
         if not candidates:
             results["no_match"] += 1
             if expense_id in already_linked_expense_ids:
-                outcome = "no_match_already_imported_by_auto"
-                results["no_match_breakdown"]["already_imported_by_auto"] += 1
+                # An existing PI already carries this expense_id - could
+                # have been set by the auto importer or by a previous
+                # backfill run. Either way, no action needed.
+                outcome = "no_match_already_linked"
+                results["no_match_breakdown"]["already_linked_elsewhere"] += 1
             else:
                 outcome = "no_match_no_pi_exists"
                 results["no_match_breakdown"]["no_pi_exists"] += 1
