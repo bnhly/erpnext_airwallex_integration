@@ -63,7 +63,7 @@ frappe.listview_settings['Purchase Invoice'].refresh = function (listview) {
                 },
                 {
                     fieldtype: 'HTML',
-                    options: '<p class="text-muted small">Imports APPROVED expenses only as draft Purchase Invoices. Safe to re-run: already imported expenses are skipped. Bank Transaction reference numbers in the same window are also backfilled.</p>'
+                    options: '<p class="text-muted small">Imports expenses awaiting approval (the "pending" state in Airwallex) as draft Purchase Invoices. Safe to re-run: already imported expenses are skipped. Bank Transaction reference numbers in the same window are also backfilled.</p>'
                 }
             ],
             primary_action_label: __('Start Import'),

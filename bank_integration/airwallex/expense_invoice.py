@@ -2,7 +2,8 @@
 Airwallex Spend Expenses -> ERPNext Purchase Invoice (DRAFT) importer.
 
 Behaviour
-- Pulls APPROVED expenses only, over a created_at date window.
+- Pulls expenses in the workflow states listed in IMPORT_STATUSES
+  (defaults to AWAITING_APPROVAL i.e. "pending") over a created_at window.
 - Creates one Purchase Invoice per expense, left in DRAFT (not submitted), so
   the GL account can be corrected manually before submission.
 - GST is applied only to AUD expenses. For AUD the item rate is the net amount
@@ -44,7 +45,14 @@ NON_AUD_TAX_TEMPLATE = "FRE - GST FREE (TM)"
 LETTER_HEAD = "General TM"
 TITLE_PREFIX = "AirW "
 GST_DIVISOR = 1.1
-APPROVED_STATUS = ["APPROVED"]
+# Airwallex Spend Expense statuses to import. The full enum is DRAFT,
+# AWAITING_APPROVAL, REJECTED, APPROVED, ARCHIVED. "Pending" in the
+# Airwallex workflow is AWAITING_APPROVAL - expenses that the cardholder
+# has submitted but no approver has actioned yet. The importer is
+# idempotent (custom_tm_airwallex_expense_id is unique) so a row imported
+# at this status stays out of subsequent runs even if it later moves to
+# APPROVED or ARCHIVED in Airwallex.
+IMPORT_STATUSES = ["AWAITING_APPROVAL"]
 IMPORT_ATTACHMENTS = True
 
 # card_id (UUID) -> friendly cardholder name. Optional. Unmapped = blank card.
@@ -104,7 +112,8 @@ def enqueue_expense_import(from_date=None, to_date=None):
 
 
 def run_expense_import(from_date=None, to_date=None):
-    """Import APPROVED expenses created within the window into draft PIs."""
+    """Import expenses in IMPORT_STATUSES (default AWAITING_APPROVAL aka
+    "pending") created within the window into draft PIs."""
     settings = frappe.get_single("Bank Integration Setting")
 
     if not getattr(settings, "airwallex_clients", None):
@@ -125,7 +134,7 @@ def run_expense_import(from_date=None, to_date=None):
             token = api.get_valid_token()
 
             for expense in api.iter_all(
-                status=APPROVED_STATUS,
+                status=IMPORT_STATUSES,
                 from_created_at=from_iso,
                 to_created_at=to_iso,
             ):
