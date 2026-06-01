@@ -49,51 +49,23 @@ LETTER_HEAD = "General TM"
 TITLE_PREFIX = "AirW "
 GST_DIVISOR = 1.1
 # Airwallex Spend Expense statuses to import. The full enum is DRAFT,
-# AWAITING_APPROVAL, REJECTED, APPROVED, ARCHIVED. APPROVED is the safest
-# state to import from because the approver has acted as a human
-# checkpoint - they only approve expenses that should hit ERPNext, and
-# they can mark exceptions (e.g. PO-bound expenses) with the
-# SKIP_DESCRIPTION_TAGS markers below before approving. The importer is
-# idempotent (custom_tm_airwallex_expense_id is unique) so a row imported
-# here stays out of subsequent runs.
+# AWAITING_APPROVAL, REJECTED, APPROVED, ARCHIVED. APPROVED is the single
+# gateway - the approver has acted as a human checkpoint and only
+# approves expenses that should hit ERPNext. Any other filtering happens
+# upstream of approval (in Airwallex Spend) so the integration stays
+# simple: approved = imported, unapproved = not.
+#
+# The one opt-out the approver has is to append a SKIP_DESCRIPTION_TAGS
+# token to the expense description before approving. See below.
 IMPORT_STATUSES = ["APPROVED"]
 
 # Tokens that, if present anywhere in the cardholder description, cause
-# the importer to skip the expense. Default to "#no_export" - the
-# approver types or appends this when the expense should not become a
-# draft PI in ERPNext (e.g. a PO already exists for the purchase and the
-# PI will be created from the PO workflow, or it was already entered
-# manually). Match is case-insensitive and whole-word.
+# the importer to skip the expense even though it is APPROVED. Default
+# is "#no_export" - the approver types or appends this when the expense
+# should not become a draft PI in ERPNext (e.g. a PO already exists for
+# the purchase and the PI will be created from the PO workflow, or it
+# was already entered manually). Match is case-insensitive, whole-word.
 SKIP_DESCRIPTION_TAGS = {"#no_export"}
-
-# Require an expense to be "complete" before importing - has at least one
-# attached receipt AND a non-empty cardholder description. Airwallex Spend
-# leaves an expense in AWAITING_APPROVAL even when these are missing, so
-# the API status filter alone is not enough. The Airwallex dashboard
-# surfaces these as "Incomplete" badges; we want to wait until the
-# cardholder fills the missing fields before pulling the expense into
-# ERPNext. Set to False to revert to status-only filtering.
-REQUIRE_COMPLETE_EXPENSE = True
-
-# Per-expense "import disposition" override, sourced from a custom
-# accounting field configured in Airwallex Spend (type=OTHER). The
-# cardholder or approver picks a value when reviewing an expense; any
-# value in IMPORT_DISPOSITION_SKIP triggers the importer to skip that
-# expense. Empty / missing field = import (the default behaviour for
-# expenses created before the custom field existed).
-#
-# Configure the field in Airwallex Spend:
-#   Settings -> Custom Fields -> Add
-#     Name: "ERPNext Import"  (must match IMPORT_DISPOSITION_FIELD_NAME)
-#     Type: dropdown / single select, optional
-#     Values include at least one of the strings in
-#     IMPORT_DISPOSITION_SKIP below, e.g. "Match to PO".
-IMPORT_DISPOSITION_FIELD_NAME = "ERPNext Import"
-IMPORT_DISPOSITION_SKIP = {
-    "Match to PO",
-    "Already in ERPNext",
-    "Do not import",
-}
 IMPORT_ATTACHMENTS = True
 
 # card_id (UUID) -> friendly cardholder name. Optional. Unmapped = blank card.
@@ -166,8 +138,7 @@ def run_expense_import(from_date=None, to_date=None):
 
     totals = {
         "scanned": 0, "created": 0, "duplicate": 0, "errors": 0,
-        "attachments": 0, "skipped_incomplete": 0, "skipped_wrong_status": 0,
-        "skipped_by_disposition": 0, "skipped_by_tag": 0,
+        "attachments": 0, "skipped_wrong_status": 0, "skipped_by_tag": 0,
     }
 
     for client in settings.airwallex_clients:
@@ -198,17 +169,8 @@ def run_expense_import(from_date=None, to_date=None):
                     totals["skipped_wrong_status"] += 1
                     continue
 
-                if REQUIRE_COMPLETE_EXPENSE and not _is_complete_expense(expense):
-                    totals["skipped_incomplete"] += 1
-                    continue
-
                 if _description_has_skip_tag(expense.get("description")):
                     totals["skipped_by_tag"] += 1
-                    continue
-
-                disposition = _import_disposition(expense)
-                if disposition in IMPORT_DISPOSITION_SKIP:
-                    totals["skipped_by_disposition"] += 1
                     continue
 
                 if purchase_invoice_exists(expense_id):
@@ -248,9 +210,7 @@ def run_expense_import(from_date=None, to_date=None):
         f"Airwallex expense import complete. "
         f"Scanned {totals['scanned']}, created {totals['created']} draft PIs, "
         f"skipped {totals['duplicate']} already imported, "
-        f"skipped {totals['skipped_incomplete']} incomplete (no receipt or no description), "
         f"skipped {totals['skipped_by_tag']} by description tag, "
-        f"skipped {totals['skipped_by_disposition']} by ERPNext Import field, "
         f"skipped {totals['skipped_wrong_status']} wrong status, "
         f"errors {totals['errors']}, attachments {totals['attachments']}."
     )
@@ -442,28 +402,6 @@ def _download(url, token):
 # ----------------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------------
-def _import_disposition(expense):
-    """Return the cardholder/approver-set "ERPNext Import" disposition
-    string for an expense, or empty string if the field is not set.
-
-    Searches both the expense-level accounting_field_selections and the
-    per-line_item ones, because Airwallex allows custom fields at either
-    level depending on how the tenant configured the field.
-    """
-    selections = list(expense.get("accounting_field_selections") or [])
-    for line in expense.get("line_items") or []:
-        selections.extend(line.get("accounting_field_selections") or [])
-    for sel in selections:
-        if sel.get("type") != "OTHER":
-            continue
-        if (sel.get("name") or "").strip() != IMPORT_DISPOSITION_FIELD_NAME:
-            continue
-        value = (sel.get("value") or sel.get("value_label") or "").strip()
-        if value:
-            return value
-    return ""
-
-
 def _description_has_skip_tag(description):
     """Whole-word, case-insensitive check for any of SKIP_DESCRIPTION_TAGS
     in the description string."""
@@ -482,20 +420,6 @@ def _strip_skip_tags(text):
     skip_lower = {t.lower() for t in SKIP_DESCRIPTION_TAGS}
     kept = [tok for tok in text.split() if tok.lower() not in skip_lower]
     return " ".join(kept).strip()
-
-
-def _is_complete_expense(expense):
-    """An expense is "complete" when the cardholder has both attached a
-    receipt and written a description (memo). Airwallex Spend leaves the
-    status at AWAITING_APPROVAL even when these are missing - the
-    dashboard surfaces it with an "Incomplete" badge - and these are the
-    rows we want to defer until the cardholder fills the missing fields.
-    """
-    if not expense.get("attachments"):
-        return False
-    if not (expense.get("description") or "").strip():
-        return False
-    return True
 
 
 def purchase_invoice_exists(expense_id):
