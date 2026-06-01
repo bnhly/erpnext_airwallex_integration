@@ -376,15 +376,35 @@ def purchase_invoice_exists(expense_id):
 
 
 def _iso_range(settings, from_date, to_date):
-    """Return inclusive from / exclusive to ISO8601 strings for the API."""
+    """Return inclusive from / exclusive to ISO8601 strings for the API.
+
+    Treats the user-supplied date as local-time midnight (per the site's
+    system timezone), then converts to UTC for the Airwallex API. Without
+    this conversion the window slid by ~10 hours for AU sites because
+    midnight UTC is 10am Melbourne, so picking "from 2026-05-01" missed
+    spend that happened in the first 10 hours of May 1 local time.
+    """
+    import pytz
+    from datetime import datetime, time
+
     if not to_date:
         to_date = today()
     if not from_date:
         from_date = add_days(getdate(to_date), -30)
-    from_iso = f"{getdate(from_date).isoformat()}T00:00:00Z"
+
+    try:
+        tz = pytz.timezone(frappe.utils.get_system_timezone())
+    except Exception:
+        tz = pytz.UTC
+
+    from_dt = tz.localize(datetime.combine(getdate(from_date), time.min))
     # to_created_at is exclusive, so push to the start of the day after to_date
-    to_iso = f"{add_days(getdate(to_date), 1).isoformat()}T00:00:00Z"
-    return from_iso, to_iso
+    to_dt = tz.localize(datetime.combine(add_days(getdate(to_date), 1), time.min))
+
+    def _to_z(dt):
+        return dt.astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    return _to_z(from_dt), _to_z(to_dt)
 
 
 def _to_float(value, default=0.0):
