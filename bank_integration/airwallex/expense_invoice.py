@@ -140,6 +140,8 @@ def run_expense_import(from_date=None, to_date=None):
         "scanned": 0, "created": 0, "duplicate": 0, "errors": 0,
         "attachments": 0, "skipped_wrong_status": 0, "skipped_by_tag": 0,
     }
+    # Each entry: {expense_id, date, amount, currency, card_name, description}
+    skipped_tag_details = []
 
     for client in settings.airwallex_clients:
         try:
@@ -171,6 +173,14 @@ def run_expense_import(from_date=None, to_date=None):
 
                 if _description_has_skip_tag(expense.get("description")):
                     totals["skipped_by_tag"] += 1
+                    skipped_tag_details.append({
+                        "expense_id": expense_id,
+                        "date": (expense.get("settled_at") or expense.get("created_at") or "")[:10],
+                        "amount": expense.get("billing_amount"),
+                        "currency": (expense.get("billing_currency") or "").upper(),
+                        "card_name": _card_name_map().get(expense.get("card_id"), ""),
+                        "description": expense.get("description"),
+                    })
                     continue
 
                 if purchase_invoice_exists(expense_id):
@@ -206,7 +216,8 @@ def run_expense_import(from_date=None, to_date=None):
                 title="AirW Expense Import Error",
             )
 
-    summary = (
+    # Plain text for the integration log (searchable, compact).
+    log_summary = (
         f"Airwallex expense import complete. "
         f"Scanned {totals['scanned']}, created {totals['created']} draft PIs, "
         f"skipped {totals['duplicate']} already imported, "
@@ -214,14 +225,112 @@ def run_expense_import(from_date=None, to_date=None):
         f"skipped {totals['skipped_wrong_status']} wrong status, "
         f"errors {totals['errors']}, attachments {totals['attachments']}."
     )
-    bi_log.create_log(summary, status="Error" if totals["errors"] else "Success")
+    bi_log.create_log(log_summary, status="Error" if totals["errors"] else "Success")
     frappe.db.commit()
+
+    # Rich HTML for the popup the user sees in Desk. Uses Bootstrap-
+    # compatible classes only (text-muted, table, badge etc.) so the
+    # styling adapts to whichever Frappe theme - light or dark - the user
+    # has selected.
+    html_summary = _build_import_summary_html(totals, skipped_tag_details, from_date, to_date)
 
     frappe.publish_realtime(
         "expense_import_complete",
-        {"status": "error" if totals["errors"] else "success", "message": summary},
+        {"status": "error" if totals["errors"] else "success", "message": html_summary},
     )
-    return summary
+    return log_summary
+
+
+def _build_import_summary_html(totals, skipped_tag_details, from_date, to_date):
+    """Build the HTML body for the completion msgprint.
+
+    Style targets: Frappe Bootstrap classes only (table, table-sm,
+    table-bordered, text-muted, small, code) so the output picks up
+    Frappe's CSS variables for both light and dark themes. No inline
+    colours, no hardcoded backgrounds.
+    """
+    from frappe.utils import escape_html
+
+    def _row(label, value, accent=""):
+        if accent:
+            value = f'<span class="{accent}">{value}</span>'
+        return f'<tr><th style="width:60%">{label}</th><td class="text-right">{value}</td></tr>'
+
+    summary_rows = [
+        _row("Created draft Purchase Invoices", totals["created"], "text-success"),
+        _row("Skipped &mdash; already imported", totals["duplicate"], "text-muted"),
+        _row('Skipped &mdash; <code>#no_export</code> tag', totals["skipped_by_tag"], "text-muted"),
+        _row("Skipped &mdash; wrong status", totals["skipped_wrong_status"], "text-muted"),
+        _row("Errors", totals["errors"], "text-danger" if totals["errors"] else "text-muted"),
+        _row("Attachments downloaded", totals["attachments"], "text-muted"),
+        _row("Expenses scanned (total)", totals["scanned"], "text-muted"),
+    ]
+
+    skipped_section = ""
+    if skipped_tag_details:
+        rows = []
+        for d in skipped_tag_details:
+            amount = ""
+            try:
+                amount = f"{float(d['amount']):.2f}"
+            except (TypeError, ValueError):
+                amount = escape_html(str(d.get("amount") or ""))
+            rows.append(
+                "<tr>"
+                f"<td>{escape_html(d['date'] or '')}</td>"
+                f'<td class="text-right">{escape_html(d["currency"] or "")} {amount}</td>'
+                f"<td>{escape_html(d['card_name'] or '')}</td>"
+                f"<td>{escape_html(d['description'] or '')}</td>"
+                "</tr>"
+            )
+        skipped_section = f"""
+        <h6 style="margin-top:18px;">Skipped by <code>#no_export</code></h6>
+        <p class="text-muted small">These approved expenses were intentionally
+        excluded from import because the approver tagged them in the
+        description. Typical reasons: a PO will create the PI separately,
+        or the entry was already made manually.</p>
+        <div style="max-height:260px;overflow:auto;">
+        <table class="table table-sm table-bordered">
+            <thead>
+                <tr>
+                    <th>Date</th>
+                    <th class="text-right">Amount</th>
+                    <th>Card</th>
+                    <th>Description</th>
+                </tr>
+            </thead>
+            <tbody>{''.join(rows)}</tbody>
+        </table>
+        </div>
+        """
+
+    window_html = ""
+    if from_date or to_date:
+        window_html = (
+            f'<p class="text-muted small" style="margin-bottom:8px;">'
+            f"Window: <code>{escape_html(str(from_date or ''))}</code> &rarr; "
+            f"<code>{escape_html(str(to_date or ''))}</code></p>"
+        )
+
+    return f"""
+    <div>
+        {window_html}
+        <table class="table table-sm table-bordered">
+            <tbody>{''.join(summary_rows)}</tbody>
+        </table>
+
+        <p class="text-muted small" style="margin-top:8px;">
+            <strong>Duplicate protection:</strong> every imported expense
+            carries its Airwallex expense ID on the resulting Purchase
+            Invoice (<code>custom_tm_airwallex_expense_id</code>). Re-running
+            the import over the same or overlapping date range will not
+            create duplicate Purchase Invoices &mdash; already-imported
+            rows are detected and skipped automatically.
+        </p>
+
+        {skipped_section}
+    </div>
+    """
 
 
 # ----------------------------------------------------------------------------

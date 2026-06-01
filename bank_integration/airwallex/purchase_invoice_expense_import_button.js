@@ -32,6 +32,7 @@ frappe.listview_settings['Purchase Invoice'].refresh = function (listview) {
             frappe.msgprint({
                 title: __('Airwallex Expense Import'),
                 indicator: data.status === 'success' ? 'green' : 'orange',
+                wide: true,
                 message: data.message
             });
         });
@@ -63,7 +64,23 @@ frappe.listview_settings['Purchase Invoice'].refresh = function (listview) {
                 },
                 {
                     fieldtype: 'HTML',
-                    options: '<p class="text-muted small">Imports APPROVED expenses as draft Purchase Invoices. To exclude a specific expense (e.g. when a PO is being raised separately) append <code>#no_export</code> to the description in Airwallex before approving. Safe to re-run: already imported expenses are skipped. Bank Transaction reference numbers in the same window are also backfilled.</p>'
+                    options: [
+                        '<div style="line-height:1.5;">',
+                        '<p class="small" style="margin-bottom:8px;">',
+                        '<strong>Imports APPROVED Airwallex expenses</strong> created within the date range as Draft Purchase Invoices.',
+                        '</p>',
+
+                        '<p class="text-muted small" style="margin-bottom:8px;">',
+                        '<strong>Skip a specific expense</strong> &mdash; append <code>#no_export</code> anywhere in its description in Airwallex <em>before</em> approving it. ',
+                        'Typical reasons: a PO will create the PI separately, or the expense was already entered manually.',
+                        '</p>',
+
+                        '<p class="text-muted small" style="margin-bottom:0;">',
+                        '<strong>Safe to re-run.</strong> Each Purchase Invoice carries its Airwallex expense ID, so already-imported expenses are detected and skipped &mdash; no duplicates from overlapping date ranges. ',
+                        'Bank Transaction reference numbers in the same window are also backfilled.',
+                        '</p>',
+                        '</div>'
+                    ].join('')
                 }
             ],
             primary_action_label: __('Start Import'),
