@@ -560,8 +560,13 @@ def create_draft_invoice(
     expense_id = expense.get("id")
     raw_description = (expense.get("description") or "").strip()
 
+    # NB: pass ``issuing_cache`` through directly (do not use ``or {}``).
+    # ``or {}`` would substitute a fresh literal whenever the caller-shared
+    # dict was empty, silently breaking the cache on the first call.
+    # ``lookup_issuing_transaction`` accepts ``None`` so the optional case
+    # still works for tests that omit the kwarg.
     issuing_data = _enrich_expense_via_issuing(
-        expense, ft_index or [], client, api_url, issuing_cache or {}
+        expense, ft_index, client, api_url, issuing_cache
     )
     # Prefer the canonical Issuing merchant. Fall back to whatever the
     # Spend Expense exposes (usually null on this tenant) so old test
