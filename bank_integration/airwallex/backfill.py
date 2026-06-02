@@ -65,7 +65,13 @@ def _fetch_financial_transactions_map(api, from_iso, to_iso):
 
 
 @frappe.whitelist()
-def backfill_reference_numbers(from_date, to_date, client_index=0, dry_run=0):
+def backfill_reference_numbers(
+    from_date,
+    to_date,
+    client_index=0,
+    dry_run=0,
+    force_overwrite=0,
+):
     """Backfill ``reference_number`` on Bank Transactions in the date
     range using the current resolver logic.
 
@@ -74,10 +80,20 @@ def backfill_reference_numbers(from_date, to_date, client_index=0, dry_run=0):
         client_index: which Airwallex client row to use for credentials
             (defaults to the first one, matching the live sync).
         dry_run: pass 1 to report what would change without writing.
+        force_overwrite: pass 1 to rewrite rows whose ``reference_number``
+            is already populated. Default is to skip them (fill-in-blanks
+            only). Use this once after a resolver change to migrate
+            existing rows to the new format.
 
     Returns:
         Summary dict with counts.
     """
+    if "Accounts Manager" not in frappe.get_roles():
+        frappe.throw(
+            "Only Accounts Manager may run backfill_reference_numbers.",
+            frappe.PermissionError,
+        )
+
     settings = frappe.get_single("Bank Integration Setting")
     if not settings.airwallex_clients:
         return {"error": "no Airwallex clients configured"}
@@ -85,6 +101,7 @@ def backfill_reference_numbers(from_date, to_date, client_index=0, dry_run=0):
     api_url = settings.api_url
     from_iso, to_iso = _iso_range(from_date, to_date)
     dry_run = bool(int(dry_run))
+    force_overwrite = bool(int(force_overwrite))
 
     ft_api = FinancialTransactions(
         client_id=client.airwallex_client_id,
@@ -93,6 +110,9 @@ def backfill_reference_numbers(from_date, to_date, client_index=0, dry_run=0):
     )
     txn_by_id = _fetch_financial_transactions_map(ft_api, from_iso, to_iso)
     expense_index = build_expense_merchant_index(client, api_url, from_iso, to_iso)
+    # Shared Issuing-transaction cache so a backfill spanning many BTs
+    # only hits each card swipe once.
+    issuing_cache = {}
 
     bank_txns = frappe.get_all(
         "Bank Transaction",
@@ -108,26 +128,33 @@ def backfill_reference_numbers(from_date, to_date, client_index=0, dry_run=0):
         "skipped_already_set": 0,
         "skipped_no_match": 0,
         "skipped_no_value": 0,
+        "skipped_unchanged": 0,
         "updated": 0,
         "samples": [],
     }
 
     for bt in bank_txns:
-        if bt.reference_number:
+        if bt.reference_number and not force_overwrite:
             totals["skipped_already_set"] += 1
             continue
         txn = txn_by_id.get(bt.transaction_id)
         if not txn:
             totals["skipped_no_match"] += 1
             continue
-        new_ref = _resolve_party_name(txn, client, api_url, expense_index)
+        new_ref = _resolve_party_name(
+            txn, client, api_url, expense_index, issuing_cache=issuing_cache
+        )
         if not new_ref:
             totals["skipped_no_value"] += 1
+            continue
+        if new_ref == bt.reference_number:
+            totals["skipped_unchanged"] += 1
             continue
         if len(totals["samples"]) < 10:
             totals["samples"].append({
                 "bank_transaction": bt.name,
                 "source_type": bt.airwallex_source_type,
+                "previous": bt.reference_number,
                 "reference_number": new_ref,
             })
         if not dry_run:
@@ -143,6 +170,7 @@ def backfill_reference_numbers(from_date, to_date, client_index=0, dry_run=0):
     if not dry_run:
         frappe.db.commit()
     totals["dry_run"] = dry_run
+    totals["force_overwrite"] = force_overwrite
     return totals
 
 

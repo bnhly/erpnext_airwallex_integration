@@ -116,6 +116,10 @@ def sync_client_transactions(client, from_date_iso, to_date_iso, settings):
         expense_index = build_expense_merchant_index(
             client, settings.api_url, from_date_iso, to_date_iso
         )
+        # Shared across the per-transaction loop so each Issuing
+        # transaction (the source of the clean merchant name on
+        # CARD_PURCHASE rows) is fetched at most once per sync.
+        issuing_cache = {}
 
         for txn in transactions:
             try:
@@ -151,6 +155,7 @@ def sync_client_transactions(client, from_date_iso, to_date_iso, settings):
                     client=client,
                     api_url=settings.api_url,
                     expense_index=expense_index,
+                    issuing_cache=issuing_cache,
                 )
                 bank_txn_doc = frappe.get_doc(bank_txn)
                 bank_txn_doc.insert()

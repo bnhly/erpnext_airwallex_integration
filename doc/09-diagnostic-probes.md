@@ -1,6 +1,6 @@
 # Diagnostic Probes
 
-Two whitelisted helpers in `bank_integration/airwallex/utils.py` let an
+A single whitelisted helper in `bank_integration/airwallex/utils.py` lets an
 Accounts Manager spot-check Airwallex API responses from the browser without
 needing a code push.
 
@@ -33,22 +33,9 @@ Parameters:
 Errors come back as `{"error": true, "status_code": 4xx, "message": "..."}`
 rather than raising.
 
-## `probe_issuing` — Bank Transaction × Issuing pairing
-
-Trial-specific. Pulls the most recent CARD_PURCHASE / CARD_REFUND Bank
-Transactions and pairs each with the Issuing API merchant payload so we can
-decide what format to put into `reference_number`.
-
-```
-/api/method/bank_integration.airwallex.utils.probe_issuing?limit=10
-```
-
-Will be removed once the merchant + description combo is wired into
-`_resolve_party_name`.
-
 ## Security
 
-Both helpers are role-gated to Accounts Manager. The Airwallex API key has
-broad read access across the tenant (financial transactions, beneficiaries,
-card transaction details), so arbitrary endpoint calls are a privileged
-operation and must not be opened up to other roles.
+Role-gated to Accounts Manager. The Airwallex API key has broad read access
+across the tenant (financial transactions, beneficiaries, card transaction
+details), so arbitrary endpoint calls are a privileged operation and must
+not be opened up to other roles.

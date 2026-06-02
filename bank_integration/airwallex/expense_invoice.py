@@ -27,9 +27,15 @@ Edit the CONFIG block to match your chart of accounts if anything changes.
 
 import frappe
 import requests
+from datetime import datetime
 from frappe.utils import getdate, add_days, today, format_date
 from bank_integration.airwallex.api.expenses import Expenses
+from bank_integration.airwallex.api.financial_transactions import FinancialTransactions
 from bank_integration.airwallex.api.base_api import AirwallexAPIError
+from bank_integration.airwallex.utils import (
+    extract_issuing_merchant,
+    lookup_issuing_transaction,
+)
 from bank_integration.bank_integration.doctype.bank_integration_log import (
     bank_integration_log as bi_log,
 )
@@ -99,6 +105,158 @@ def _card_name_map():
 
 
 # ----------------------------------------------------------------------------
+# Financial-transaction matching for Issuing enrichment
+# ----------------------------------------------------------------------------
+def _build_ft_index_for_card_txns(client, api_url, from_iso, to_iso):
+    """Pull every CARD_PURCHASE / CARD_REFUND financial transaction in
+    the window and return a list we can match Spend Expenses against to
+    obtain the Issuing transaction id (``source_id``). One paginated list
+    call per import; matched results are cached, so total cost is roughly
+    one extra API call per unique imported expense.
+
+    Returns a list of dicts: ``{source_id, source_type, amount, currency,
+    settled_at}``. Returns ``[]`` on error or when called without
+    credentials.
+    """
+    if not (client and api_url and from_iso and to_iso):
+        return []
+    try:
+        api = FinancialTransactions(
+            client_id=client.airwallex_client_id,
+            api_key=client.get_password("airwallex_api_key"),
+            api_url=api_url,
+        )
+        entries = []
+        page_num = 0
+        while True:
+            resp = api.get_list(
+                from_created_at=from_iso,
+                to_created_at=to_iso,
+                page_num=page_num,
+                page_size=1000,
+            ) or {}
+            items = resp.get("items") or resp.get("data") or []
+            if not items:
+                break
+            for ft in items:
+                if ft.get("source_type") not in ("CARD_PURCHASE", "CARD_REFUND"):
+                    continue
+                source_id = ft.get("source_id")
+                if not source_id:
+                    continue
+                try:
+                    amount = round(abs(float(ft.get("amount") or 0)), 2)
+                except (TypeError, ValueError):
+                    continue
+                currency = (ft.get("currency") or "").upper()
+                if not (amount and currency):
+                    continue
+                entries.append({
+                    "source_id": source_id,
+                    "source_type": ft.get("source_type"),
+                    "amount": amount,
+                    "currency": currency,
+                    "settled_at": ft.get("settled_at") or "",
+                })
+            if not resp.get("has_more"):
+                break
+            page_num += 1
+        return entries
+    except AirwallexAPIError as e:
+        frappe.logger().info(
+            f"FT list for issuing enrichment failed: {e.status_code} {str(e.message)[:200]}"
+        )
+        return []
+
+
+def _iso_to_dt(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _match_expense_to_ft(expense, ft_index):
+    """Find the CARD_PURCHASE / CARD_REFUND financial transaction backing a
+    Spend Expense. Returns the matched FT dict from ``ft_index`` or
+    ``None``. Matches by ``(billing_amount, billing_currency)`` first and
+    falls back to the original card-transaction currency for FX swipes.
+    Tiebreaks by ``settled_at`` distance."""
+    if not ft_index:
+        return None
+
+    # Try billing pair, then card_transaction pair (covers FX swipes
+    # where billing was converted to wallet currency).
+    keys = []
+    try:
+        bill_amount = round(abs(float(expense.get("billing_amount") or 0)), 2)
+    except (TypeError, ValueError):
+        bill_amount = 0
+    bill_currency = (expense.get("billing_currency") or "").upper()
+    if bill_amount and bill_currency:
+        keys.append((bill_amount, bill_currency))
+
+    ct = expense.get("card_transaction") or {}
+    try:
+        ct_amount = round(abs(float(ct.get("amount") or 0)), 2)
+    except (TypeError, ValueError):
+        ct_amount = 0
+    ct_currency = (ct.get("currency") or "").upper()
+    if ct_amount and ct_currency and (ct_amount, ct_currency) not in keys:
+        keys.append((ct_amount, ct_currency))
+
+    candidates = []
+    for amount, currency in keys:
+        candidates = [
+            ft for ft in ft_index
+            if ft["amount"] == amount and ft["currency"] == currency
+        ]
+        if candidates:
+            break
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    target_dt = _iso_to_dt(expense.get("settled_at") or expense.get("created_at"))
+    if not target_dt:
+        return None
+    scored = []
+    for ft in candidates:
+        ft_dt = _iso_to_dt(ft.get("settled_at"))
+        if ft_dt:
+            scored.append((abs((ft_dt - target_dt).total_seconds()), ft))
+    if not scored:
+        return None
+    scored.sort(key=lambda pair: pair[0])
+    if len(scored) > 1 and scored[1][0] > 0 and scored[0][0] / max(scored[1][0], 1) > 0.5:
+        return None
+    return scored[0][1]
+
+
+def _enrich_expense_via_issuing(expense, ft_index, client, api_url, issuing_cache):
+    """Look up the Issuing transaction behind a Spend Expense and return
+    a dict ``{"merchant": str, "card_nickname": str}``. Empty strings if
+    matching or lookup fails; callers should fall back to the existing
+    Spend-Expense / site_config values in that case."""
+    blank = {"merchant": "", "card_nickname": ""}
+    ft = _match_expense_to_ft(expense, ft_index)
+    if not ft:
+        return blank
+    issuing_txn = lookup_issuing_transaction(
+        ft["source_id"], client, api_url, cache=issuing_cache
+    )
+    if not issuing_txn:
+        return blank
+    return {
+        "merchant": extract_issuing_merchant(issuing_txn),
+        "card_nickname": (issuing_txn.get("card_nickname") or "").strip(),
+    }
+
+
+# ----------------------------------------------------------------------------
 # Entry points
 # ----------------------------------------------------------------------------
 @frappe.whitelist()
@@ -149,6 +307,18 @@ def run_expense_import(from_date=None, to_date=None):
     # account currency) all hit the same Airwallex tenant, so without
     # this in-run dedup each expense would be processed once per client.
     seen_expense_ids = set()
+
+    # Pre-fetch the financial_transactions for this window once. Used to
+    # map each Spend Expense back to its Issuing transaction id (the
+    # Spend response itself doesn't expose this link), which then lets us
+    # pull the clean merchant name and cardholder nickname for the PI
+    # remarks. Lookups are cached so we don't re-hit Issuing for the same
+    # source_id.
+    first_client = settings.airwallex_clients[0]
+    ft_index = _build_ft_index_for_card_txns(
+        first_client, settings.api_url, from_iso, to_iso
+    )
+    issuing_cache = {}
 
     for client in settings.airwallex_clients:
         try:
@@ -207,7 +377,13 @@ def run_expense_import(from_date=None, to_date=None):
                     continue
 
                 try:
-                    pi = create_draft_invoice(expense)
+                    pi = create_draft_invoice(
+                        expense,
+                        ft_index=ft_index,
+                        issuing_cache=issuing_cache,
+                        client=client,
+                        api_url=settings.api_url,
+                    )
                     totals["created"] += 1
 
                     if IMPORT_ATTACHMENTS:
@@ -366,13 +542,39 @@ def _build_import_summary_html(totals, skipped_tag_details, from_date, to_date):
 # ----------------------------------------------------------------------------
 # Invoice construction
 # ----------------------------------------------------------------------------
-def create_draft_invoice(expense):
-    """Build and insert one draft Purchase Invoice for an expense."""
+def create_draft_invoice(
+    expense,
+    ft_index=None,
+    issuing_cache=None,
+    client=None,
+    api_url=None,
+):
+    """Build and insert one draft Purchase Invoice for an expense.
+
+    ``ft_index`` / ``issuing_cache`` / ``client`` / ``api_url`` are optional
+    and let the function look up the underlying Issuing transaction to get
+    the canonical merchant name and cardholder nickname. When any are
+    missing the function falls back to whatever the Spend Expense itself
+    carries (merchant is null on this tenant) plus the site_config
+    ``airwallex_card_names`` mapping for the card name."""
     expense_id = expense.get("id")
-    merchant = (expense.get("merchant") or "").strip()
     raw_description = (expense.get("description") or "").strip()
+
+    issuing_data = _enrich_expense_via_issuing(
+        expense, ft_index or [], client, api_url, issuing_cache or {}
+    )
+    # Prefer the canonical Issuing merchant. Fall back to whatever the
+    # Spend Expense exposes (usually null on this tenant) so old test
+    # paths keep working.
+    merchant = issuing_data["merchant"] or (expense.get("merchant") or "").strip()
     memo = (_strip_skip_tags(raw_description) or merchant or "Airwallex expense").strip()
-    card_name = _card_name_map().get(expense.get("card_id"), "")
+    # Prefer the Issuing cardholder nickname over the manually maintained
+    # site_config map. The nickname is what shows in the Airwallex UI as
+    # the card name and is automatically correct for newly issued cards.
+    card_name = (
+        issuing_data["card_nickname"]
+        or _card_name_map().get(expense.get("card_id"), "")
+    )
 
     billing_currency = (expense.get("billing_currency") or "AUD").upper()
     gross = _to_float(expense.get("billing_amount"))

@@ -4,6 +4,7 @@ from datetime import datetime
 from bank_integration.airwallex.api.base_api import AirwallexAPIError
 from bank_integration.airwallex.api.deposits import Deposits
 from bank_integration.airwallex.api.expenses import Expenses
+from bank_integration.airwallex.api.issuing import Issuing
 from bank_integration.airwallex.api.transfers import Transfers
 
 
@@ -93,10 +94,13 @@ def _iso_to_dt(value):
         return None
 
 
-def _match_card_merchant(txn, expense_index):
-    """Find the merchant for a CARD_PURCHASE / CARD_REFUND by matching
-    against the expense index built earlier in the sync. Returns the
-    merchant name or empty string when there is no unambiguous match."""
+def _match_card_description(txn, expense_index):
+    """Find the staff-entered description for a CARD_PURCHASE / CARD_REFUND
+    by matching against the expense index built earlier in the sync. The
+    expense ``merchant`` field is null on this tenant so the index actually
+    carries the cardholder's description text (build_expense_merchant_index
+    falls back to it). Returns the description string or empty when there
+    is no unambiguous match."""
     if not expense_index:
         return ""
     try:
@@ -117,9 +121,8 @@ def _match_card_merchant(txn, expense_index):
         return candidates[0]["merchant"]
 
     # Multiple candidates with the same (amount, currency). If they all
-    # carry the same name string, there is no ambiguity to resolve - the
-    # answer is identical whichever expense we pick. This is the common
-    # case for repeated identical card swipes at the same merchant
+    # carry the same description string, there is no ambiguity to resolve.
+    # Common case: repeated identical card swipes at the same merchant
     # (e.g. two 99 AUD purchases on the same day).
     unique_names = {c["merchant"] for c in candidates}
     if len(unique_names) == 1:
@@ -144,7 +147,66 @@ def _match_card_merchant(txn, expense_index):
     return scored[0][1]
 
 
-def _resolve_party_name(txn, client, api_url, expense_index=None):
+# Back-compat alias - older imports still resolve.
+_match_card_merchant = _match_card_description
+
+
+def lookup_issuing_transaction(source_id, client, api_url, cache=None):
+    """Fetch one Issuing transaction by its id. ``cache`` is an optional
+    dict shared across a sync / backfill so the same transaction is only
+    fetched once. Returns the raw transaction dict or ``None`` on error."""
+    if not (source_id and client and api_url):
+        return None
+    if cache is not None and source_id in cache:
+        return cache[source_id]
+    try:
+        api = Issuing(
+            client_id=client.airwallex_client_id,
+            api_key=client.get_password("airwallex_api_key"),
+            api_url=api_url,
+        )
+        txn = api.get_transaction(source_id)
+    except AirwallexAPIError as e:
+        frappe.logger().info(
+            f"Issuing lookup failed for {source_id}: {e.status_code} {str(e.message)[:200]}"
+        )
+        txn = None
+    if cache is not None:
+        cache[source_id] = txn
+    return txn
+
+
+def extract_issuing_merchant(issuing_txn):
+    """Pull the cleanest merchant string out of an Issuing transaction
+    response. Prefers ``additional_merchant_info.merchant_full_name``
+    (e.g. "Uber") over ``merchant.name`` (e.g. "UBER *TRIP HELP.UBER.COM")
+    when both are present. Returns empty string on missing fields."""
+    if not issuing_txn:
+        return ""
+    merchant = issuing_txn.get("merchant") or {}
+    if not isinstance(merchant, dict):
+        return ""
+    additional = merchant.get("additional_merchant_info") or {}
+    if isinstance(additional, dict):
+        full = (additional.get("merchant_full_name") or "").strip()
+        if full:
+            return full
+    return (merchant.get("name") or "").strip()
+
+
+def _format_card_reference(merchant, description):
+    """Combine the canonical merchant and the staff description into a
+    single Bank Transaction reference_number value. Either side may be
+    blank, in which case the other is returned alone. Em-dash separator
+    so it reads naturally in the Bank Transaction list view."""
+    merchant = (merchant or "").strip()
+    description = (description or "").strip()
+    if merchant and description:
+        return f"{merchant} — {description}"
+    return merchant or description
+
+
+def _resolve_party_name(txn, client, api_url, expense_index=None, issuing_cache=None):
     """Return the counterparty name for the transaction, or empty string.
 
     Used to populate the Bank Transaction ``reference_number`` field so
@@ -154,17 +216,23 @@ def _resolve_party_name(txn, client, api_url, expense_index=None):
     Lookups by source_type:
       DEPOSIT                       -> GET /api/v1/deposits/{source_id}.payer_name
       TRANSFER                      -> GET /api/v1/transfers/{source_id}.beneficiary
-      CARD_PURCHASE / CARD_REFUND   -> match against ``expense_index``
-                                       built once per sync from Spend
-                                       Expenses (see
-                                       ``build_expense_merchant_index``).
+      CARD_PURCHASE / CARD_REFUND   -> Issuing API merchant + Spend Expense
+                                       staff description, combined as
+                                       "merchant -- description".
     All other source_types return "".
     """
     source_type = txn.get("source_type")
     source_id = txn.get("source_id")
 
     if source_type in ("CARD_PURCHASE", "CARD_REFUND"):
-        return _match_card_merchant(txn, expense_index)
+        merchant = ""
+        if source_id and client and api_url:
+            issuing_txn = lookup_issuing_transaction(
+                source_id, client, api_url, cache=issuing_cache
+            )
+            merchant = extract_issuing_merchant(issuing_txn)
+        description = _match_card_description(txn, expense_index)
+        return _format_card_reference(merchant, description)
 
     if not (source_id and client and api_url):
         return ""
@@ -232,7 +300,14 @@ def map_airwallex_status_to_erpnext(airwallex_status):
 
     return status_mapping.get(airwallex_status.upper(), "Unreconciled")
 
-def map_airwallex_to_erpnext(txn, bank_account, client=None, api_url=None, expense_index=None):
+def map_airwallex_to_erpnext(
+    txn,
+    bank_account,
+    client=None,
+    api_url=None,
+    expense_index=None,
+    issuing_cache=None,
+):
     """
     Maps an Airwallex transaction to ERPNext Bank Transaction format.
 
@@ -247,8 +322,10 @@ def map_airwallex_to_erpnext(txn, bank_account, client=None, api_url=None, expen
             ``client`` for the counterparty lookups to run.
         expense_index (list[dict]): Result of
             ``build_expense_merchant_index`` for the same sync window,
-            used to populate the merchant on CARD_PURCHASE / CARD_REFUND
-            rows. Optional.
+            used to provide the staff description on CARD_PURCHASE /
+            CARD_REFUND rows. Optional.
+        issuing_cache (dict): Optional dict shared across a sync run so
+            repeated Issuing-transaction lookups are deduped.
 
     Returns:
         dict: ERPNext Bank Transaction dictionary.
@@ -288,7 +365,9 @@ def map_airwallex_to_erpnext(txn, bank_account, client=None, api_url=None, expen
         "bank_account": mapped_bank_account,
         "currency": txn_currency,
         "description": txn.get("description") or txn.get("source_type", ""),
-        "reference_number": _resolve_party_name(txn, client, api_url, expense_index) or txn.get("batch_id", ""),
+        "reference_number": _resolve_party_name(
+            txn, client, api_url, expense_index, issuing_cache=issuing_cache
+        ) or txn.get("batch_id", ""),
         "transaction_id": txn.get("id"),
         "transaction_type": txn.get("transaction_type", ""),
         "deposit": amount if is_deposit else 0,
@@ -379,48 +458,4 @@ def airwallex_api_get(endpoint, params_json=None, client_index=0):
         return api.get(endpoint=endpoint.lstrip("/"), params=params)
     except AirwallexAPIError as e:
         return {"error": True, "status_code": e.status_code, "message": str(e.message)[:500]}
-
-
-@frappe.whitelist()
-def probe_issuing(limit=5):
-    """Issuing-API trial probe. Pairs recent CARD_PURCHASE / CARD_REFUND
-    Bank Transactions with their Issuing merchant payload so the result can
-    be eyeballed before we wire Issuing into _resolve_party_name.
-
-    Remove once the merchant + description combo is shipped.
-    """
-    if "Accounts Manager" not in frappe.get_roles():
-        frappe.throw("Only Accounts Manager may run this probe.", frappe.PermissionError)
-
-    rows = frappe.db.sql(
-        """
-        SELECT name, airwallex_source_id, reference_number, description, date
-        FROM `tabBank Transaction`
-        WHERE airwallex_source_type IN ('CARD_PURCHASE', 'CARD_REFUND')
-          AND airwallex_source_id IS NOT NULL
-          AND airwallex_source_id != ''
-        ORDER BY date DESC
-        LIMIT %s
-        """,
-        (int(limit),),
-        as_dict=True,
-    )
-
-    out = []
-    for r in rows:
-        entry = {
-            "bt": r.name,
-            "current_ref": r.reference_number,
-            "description": r.description,
-            "source_id": r.airwallex_source_id,
-        }
-        txn = airwallex_api_get(f"issuing/transactions/{r.airwallex_source_id}")
-        if isinstance(txn, dict) and txn.get("error"):
-            entry["error"] = f"{txn.get('status_code')} {txn.get('message')}"
-        else:
-            entry["issuing_merchant"] = (txn or {}).get("merchant") or {}
-            entry["issuing_top_level_keys"] = sorted((txn or {}).keys())
-        out.append(entry)
-
-    return out
 
