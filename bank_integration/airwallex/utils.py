@@ -325,30 +325,72 @@ def test_airwallex_mapping():
     print(f"Created: {doc.name}")
 
 
-@frappe.whitelist()
-def probe_issuing(limit=5):
-    """Temporary probe to check the Airwallex Issuing API response shape on
-    real CARD_PURCHASE / CARD_REFUND Bank Transactions. Returns the current
-    reference_number alongside the Issuing merchant payload so the result
-    can be eyeballed before we wire Issuing into _resolve_party_name.
+def _get_airwallex_client(client_index=0):
+    """Resolve credentials for an Airwallex Client row. Used by the generic
+    diagnostic helpers below. Role-gated by their callers, not here."""
+    settings = frappe.get_single("Bank Integration Setting")
+    if not settings.airwallex_clients:
+        frappe.throw("No Airwallex Clients configured on Bank Integration Setting.")
+    try:
+        client = settings.airwallex_clients[int(client_index)]
+    except (IndexError, ValueError):
+        frappe.throw(f"client_index {client_index} out of range.")
+    return client, settings.api_url
 
-    Call via /api/method/bank_integration.airwallex.utils.probe_issuing.
-    Remove this function once the trial is done.
+
+@frappe.whitelist()
+def airwallex_api_get(endpoint, params_json=None, client_index=0):
+    """Generic read-only Airwallex GET probe. Calls any endpoint via
+    AirwallexBase and returns the raw JSON. Lets us spot-check new endpoints
+    on play without a code push per investigation.
+
+    Usage:
+      /api/method/bank_integration.airwallex.utils.airwallex_api_get
+          ?endpoint=issuing/transactions/<id>
+      /api/method/bank_integration.airwallex.utils.airwallex_api_get
+          ?endpoint=spend/expenses&params_json={"page_size":5}
+
+    Restricted to Accounts Manager because the Airwallex API key has full
+    read access across the tenant and arbitrary endpoint calls can expose
+    sensitive data (card numbers, beneficiary bank details, etc.).
     """
     if "Accounts Manager" not in frappe.get_roles():
         frappe.throw("Only Accounts Manager may run this probe.", frappe.PermissionError)
+    if not endpoint:
+        frappe.throw("endpoint is required.")
 
-    from bank_integration.airwallex.api.issuing import Issuing
+    import json as _json
+    from bank_integration.airwallex.api.base_api import AirwallexBase
 
-    settings = frappe.get_single("Bank Integration Setting")
-    if not settings.airwallex_clients:
-        return {"error": "No Airwallex Clients configured."}
-    client = settings.airwallex_clients[0]
-    api = Issuing(
+    params = None
+    if params_json:
+        try:
+            params = _json.loads(params_json)
+        except (TypeError, ValueError) as e:
+            frappe.throw(f"params_json is not valid JSON: {e}")
+
+    client, api_url = _get_airwallex_client(client_index)
+    api = AirwallexBase(
         client_id=client.airwallex_client_id,
         api_key=client.get_password("airwallex_api_key"),
-        api_url=settings.api_url,
+        api_url=api_url,
     )
+    try:
+        return api.get(endpoint=endpoint.lstrip("/"), params=params)
+    except AirwallexAPIError as e:
+        return {"error": True, "status_code": e.status_code, "message": str(e.message)[:500]}
+
+
+@frappe.whitelist()
+def probe_issuing(limit=5):
+    """Issuing-API trial probe. Pairs recent CARD_PURCHASE / CARD_REFUND
+    Bank Transactions with their Issuing merchant payload so the result can
+    be eyeballed before we wire Issuing into _resolve_party_name.
+
+    Remove once the merchant + description combo is shipped.
+    """
+    if "Accounts Manager" not in frappe.get_roles():
+        frappe.throw("Only Accounts Manager may run this probe.", frappe.PermissionError)
 
     rows = frappe.db.sql(
         """
@@ -372,15 +414,12 @@ def probe_issuing(limit=5):
             "description": r.description,
             "source_id": r.airwallex_source_id,
         }
-        try:
-            txn = api.get_transaction(r.airwallex_source_id)
-            merchant = txn.get("merchant") or {}
-            entry["issuing_merchant"] = merchant
-            entry["issuing_top_level_keys"] = sorted(txn.keys())
-        except AirwallexAPIError as e:
-            entry["error"] = f"{e.status_code} {str(e.message)[:200]}"
-        except Exception as e:
-            entry["error"] = str(e)[:200]
+        txn = airwallex_api_get(f"issuing/transactions/{r.airwallex_source_id}")
+        if isinstance(txn, dict) and txn.get("error"):
+            entry["error"] = f"{txn.get('status_code')} {txn.get('message')}"
+        else:
+            entry["issuing_merchant"] = (txn or {}).get("merchant") or {}
+            entry["issuing_top_level_keys"] = sorted((txn or {}).keys())
         out.append(entry)
 
     return out
