@@ -324,3 +324,64 @@ def test_airwallex_mapping():
     doc.insert()
     print(f"Created: {doc.name}")
 
+
+@frappe.whitelist()
+def probe_issuing(limit=5):
+    """Temporary probe to check the Airwallex Issuing API response shape on
+    real CARD_PURCHASE / CARD_REFUND Bank Transactions. Returns the current
+    reference_number alongside the Issuing merchant payload so the result
+    can be eyeballed before we wire Issuing into _resolve_party_name.
+
+    Call via /api/method/bank_integration.airwallex.utils.probe_issuing.
+    Remove this function once the trial is done.
+    """
+    if "Accounts Manager" not in frappe.get_roles():
+        frappe.throw("Only Accounts Manager may run this probe.", frappe.PermissionError)
+
+    from bank_integration.airwallex.api.issuing import Issuing
+
+    settings = frappe.get_single("Bank Integration Setting")
+    if not settings.airwallex_clients:
+        return {"error": "No Airwallex Clients configured."}
+    client = settings.airwallex_clients[0]
+    api = Issuing(
+        client_id=client.airwallex_client_id,
+        api_key=client.get_password("airwallex_api_key"),
+        api_url=settings.api_url,
+    )
+
+    rows = frappe.db.sql(
+        """
+        SELECT name, airwallex_source_id, reference_number, description, date
+        FROM `tabBank Transaction`
+        WHERE airwallex_source_type IN ('CARD_PURCHASE', 'CARD_REFUND')
+          AND airwallex_source_id IS NOT NULL
+          AND airwallex_source_id != ''
+        ORDER BY date DESC
+        LIMIT %s
+        """,
+        (int(limit),),
+        as_dict=True,
+    )
+
+    out = []
+    for r in rows:
+        entry = {
+            "bt": r.name,
+            "current_ref": r.reference_number,
+            "description": r.description,
+            "source_id": r.airwallex_source_id,
+        }
+        try:
+            txn = api.get_transaction(r.airwallex_source_id)
+            merchant = txn.get("merchant") or {}
+            entry["issuing_merchant"] = merchant
+            entry["issuing_top_level_keys"] = sorted(txn.keys())
+        except AirwallexAPIError as e:
+            entry["error"] = f"{e.status_code} {str(e.message)[:200]}"
+        except Exception as e:
+            entry["error"] = str(e)[:200]
+        out.append(entry)
+
+    return out
+
