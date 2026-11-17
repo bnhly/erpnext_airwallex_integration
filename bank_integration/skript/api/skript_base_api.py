@@ -11,7 +11,9 @@ class SkriptBase:
         self.client_id = client_id
         self.client_secret = client_secret
         self.api_url = api_url
-        self.enable_api_log = True
+        # Follow the Enable Log tick on Bank Integration Setting (was always on).
+        # Errors are still logged when it is off.
+        self.enable_api_log = bool(frappe.db.get_single_value("Bank Integration Setting", "enable_log"))
         self.skript_api_scope = api_scope
         
         # Standard headers
@@ -139,10 +141,9 @@ class SkriptBase:
     def create_connection_log(self, status, message, response=None, method=None, url=None, payload=None):
         """Create log entry"""
         try:
-            if not self.enable_api_log:
-                return
-            
             status_string = "Success" if str(status).startswith("2") else "Error"
+            if status_string == "Success" and not self.enable_api_log:
+                return
             
             log = frappe.get_doc({
                 "doctype": "Bank Integration Log",

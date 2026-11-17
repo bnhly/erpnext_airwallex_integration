@@ -34,7 +34,9 @@ class AirwallexBase:
                 frappe.throw("No Airwallex clients configured")
 
         self.base_url = self.api_url
-        self.enable_api_log = True
+        # Follow the Enable Log tick on Bank Integration Setting (was always on).
+        # Errors are still logged when it is off.
+        self.enable_api_log = bool(frappe.db.get_single_value("Bank Integration Setting", "enable_log"))
 
         # Set headers based on whether this is for authentication or API calls
         if use_auth_headers:
@@ -53,6 +55,13 @@ class AirwallexBase:
             self.is_auth_instance = False
 
         self.log_data = {}
+
+    # Statuses that are an expected answer for this kind of call, not a
+    # fault: logged only when Enable Log is on. Lookup classes (Issuing,
+    # Deposits, Transfers) set (403, 404): a name that cannot be looked up
+    # just leaves the reference blank. Before 17 Nov 26 every such miss was
+    # an Error row, every hour, for every card line in the last 60 days.
+    QUIET_STATUSES = ()
 
     def authenticate_and_cache_token(self, force_fresh=False):
         """Authenticate and cache the token using database storage"""
@@ -285,6 +294,14 @@ class AirwallexBase:
         """Create log entry for connection test"""
         try:
             status_string = "Success" if str(status).startswith("2") else "Error"
+            quiet = status_string == "Success" or str(status) in {str(q) for q in self.QUIET_STATUSES}
+            if quiet and not self.enable_api_log:
+                return None
+            if "authentication/login" in str(url or self.log_data.get("url", "")):
+                # The login reply carries the access token: do not store it
+                if status_string == "Success":
+                    response = "(login reply not stored)"
+                    message = "Logged in"
             log = frappe.get_doc({
                 "doctype": "Bank Integration Log",
                 "status": str(status_string),
@@ -294,11 +311,11 @@ class AirwallexBase:
                 "url": url or self.log_data.get("url", ""),  # Use passed URL or from log_data
                 "method": str(method) if method else "",
                 "status_code": str(status),
-                "request_headers": str(headers) if headers else "",
+                # Never store the API key or the bearer token
+                "request_headers": str(self._mask_sensitive_info(headers)) if headers else "",
             })
-            if self.enable_api_log:
-                log.insert(ignore_permissions=True)
-                return log
+            log.insert(ignore_permissions=True)
+            return log
 
         except Exception as e:
             frappe.log_error(message=str(e), title="Bank Integration Log Creation Error")

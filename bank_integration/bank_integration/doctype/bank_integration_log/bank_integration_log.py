@@ -26,6 +26,14 @@ class BankIntegrationLog(Document):
 		url: DF.SmallText | None
 	# end: auto-generated types
 
+	@staticmethod
+	def clear_old_logs(days=30):
+		"""Called daily by Log Settings. Deletes in batches, so a big backlog
+		does not hold one long lock on the table."""
+		from bank_integration.feed.maintenance import delete_logs_before
+
+		delete_logs_before(frappe.utils.add_days(frappe.utils.now_datetime(), -int(days or 30)))
+
 	def validate(self):
 		if not self.status:
 			self.status = "Info"
