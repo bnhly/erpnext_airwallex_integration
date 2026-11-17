@@ -142,6 +142,65 @@ def existing_ids(ids):
     return found
 
 
+HAND_DAYS = 3
+
+
+class HandLines:
+    """Bank lines made by hand (no transaction_id): statement imports and the
+    register's scripts. A feed line with the same bank account, amount and
+    direction within HAND_DAYS of one of them is taken to be that line and is
+    NOT added again; it is listed in the run report instead. Each hand line
+    stands for one feed line only. Cancelled hand lines do not count.
+
+    Added 17 Nov 26: the look-back window and catch-up would otherwise bring
+    in a second copy of lines that were loaded by hand while the feed was
+    broken (CBA credit card lines F6, the Airwallex fee C6).
+    """
+
+    def __init__(self):
+        self.pool = {}
+        self.taken = set()
+
+    def _load(self, bank_account, day):
+        from frappe.utils import add_days, getdate
+
+        key = (bank_account, str(getdate(day))[:7])
+        if key in self.pool:
+            return self.pool[key]
+        d = getdate(day)
+        rows = frappe.db.sql(
+            """select name, date, deposit, withdrawal from `tabBank Transaction`
+               where bank_account=%s and docstatus<2 and ifnull(transaction_id,'')=''
+                 and date between %s and %s""",
+            (bank_account, add_days(d.replace(day=1), -HAND_DAYS - 1),
+             add_days(d.replace(day=28), HAND_DAYS + 5)),
+            as_dict=True,
+        )
+        self.pool[key] = rows
+        return rows
+
+    def match(self, bank_account, day, deposit, withdrawal):
+        """Name of the hand line this feed line duplicates, or None."""
+        from frappe.utils import date_diff, flt, getdate
+
+        if not (bank_account and day):
+            return None
+        dep, wd = round(flt(deposit), 2), round(flt(withdrawal), 2)
+        best = None
+        for r in self._load(bank_account, day):
+            if r.name in self.taken:
+                continue
+            if round(flt(r.deposit), 2) != dep or round(flt(r.withdrawal), 2) != wd:
+                continue
+            gap = abs(date_diff(getdate(r.date), getdate(day)))
+            if gap <= HAND_DAYS and (best is None or gap < best[0]):
+                best = (gap, r.name)
+        if best:
+            self.taken.add(best[1])
+            return best[1]
+        return None
+
+
 def insert_line(doc_dict, sp_name):
     """Insert and submit one Bank Transaction on its own savepoint.
 

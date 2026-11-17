@@ -101,8 +101,10 @@ def run_window(settings, from_dt, to_dt, dry_run=False):
         "accounts": {},
         "failed": [],
         "would_add": [],
+        "by_hand": [],
         "created": 0,
     }
+    hand = common.HandLines()
     account_map = {}
     names = {}
     for row in settings.accounts or []:
@@ -145,6 +147,14 @@ def run_window(settings, from_dt, to_dt, dry_run=False):
             "amount": txn.get("amount"), "description": (txn.get("description") or "")[:120],
             "bank_account": bank_account,
         }
+        amt = float(txn.get("amount") or 0)
+        twin = hand.match(bank_account, map_skript_to_erpnext(txn, bank_account).get("date"),
+                          amt if amt > 0 else 0, -amt if amt < 0 else 0)
+        if twin:
+            brief["hand_line"] = twin
+            report["by_hand"].append(brief)
+            part["by_hand"] = part.get("by_hand", 0) + 1
+            continue
         if dry_run:
             report["would_add"].append(brief)
             continue

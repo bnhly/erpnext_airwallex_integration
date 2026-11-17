@@ -106,8 +106,10 @@ def run_window(settings, from_dt, to_dt, dry_run=False, lookups=True, currencies
         "logins": [],
         "failed": [],
         "would_add": [],
+        "by_hand": [],
         "created": 0,
     }
+    hand = common.HandLines()
 
     for login in logins:
         row = login["key_row"]
@@ -178,6 +180,15 @@ def run_window(settings, from_dt, to_dt, dry_run=False, lookups=True, currencies
 
             if doc and not doc.get("bank_account"):
                 fail = f"No bank account for {txn.get('currency')} on {target.bank_account}"
+
+            if doc and not fail:
+                twin = hand.match(doc["bank_account"], doc.get("date"), doc.get("deposit"), doc.get("withdrawal"))
+                if twin:
+                    item = _brief(txn, target.bank_account)
+                    item["hand_line"] = twin
+                    report["by_hand"].append(item)
+                    part["by_hand"] = part.get("by_hand", 0) + 1
+                    continue
 
             if dry_run and not fail:
                 report["would_add"].append(_brief(txn, target.bank_account))

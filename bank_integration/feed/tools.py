@@ -175,12 +175,13 @@ def catch_up(provider, from_date, to_date=None, dry_run=1, confirm=None, currenc
 
     if str(dry_run) != "0":
         settings = frappe.get_single(common.DOCTYPE[provider])
-        total = {"provider": provider, "dry_run": True, "would_add": [], "failed": [],
+        total = {"provider": provider, "dry_run": True, "would_add": [], "by_hand": [], "failed": [],
                  "problems": [], "unrouted": {}, "slices": 0}
         for a, b in _slices(from_dt, to_dt):
             rep = _run(provider, settings, a, b, True, curs)
             total["slices"] += 1
             total["would_add"] += rep["would_add"]
+            total["by_hand"] += rep.get("by_hand") or []
             total["failed"] += rep["failed"]
             for p in rep.get("problems") or []:
                 if p not in total["problems"]:
@@ -189,6 +190,7 @@ def catch_up(provider, from_date, to_date=None, dry_run=1, confirm=None, currenc
                 for cur, n in lg.get("unrouted", {}).items():
                     total["unrouted"][cur] = total["unrouted"].get(cur, 0) + n
         total["count"] = len(total["would_add"])
+        total["by_hand_count"] = len(total["by_hand"])
         total["by_bank_account"] = {}
         for line in total["would_add"]:
             key = line.get("bank_account")

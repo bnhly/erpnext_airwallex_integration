@@ -358,6 +358,39 @@ def run():
     awx.style = "has_more"
     awx.page_size_cap = None
 
+    # ---- H lines loaded by hand are not added a second time
+    def hand_line(ba, day, wd):
+        d = frappe.get_doc({"doctype": "Bank Transaction", "bank_account": ba, "date": day,
+                            "withdrawal": wd, "deposit": 0, "currency": "AUD", "description": "FT by hand"})
+        d.insert(ignore_permissions=True)
+        d.submit()
+        return d.name
+
+    frappe.db.sql("delete from `tabBank Transaction` where description='FT by hand'")
+    h1 = hand_line(accts["FT AWX AUD"], (now - timedelta(days=3)).date(), 77.7)
+    frappe.db.commit()
+    awx.lines.append(line(1000, now - timedelta(days=2), net=-77.7))   # same amount, a day off: the hand line
+    awx.lines.append(line(1001, now - timedelta(days=2, hours=1), net=-77.7))   # a second swipe of 77.70: real
+    awx.lines.append(line(1002, now - timedelta(days=2), net=-77.8))   # other amount: real
+    sync_scheduled_transactions(None, "Hourly")
+    rep = json.loads(frappe.db.get_single_value("Airwallex Settings", "sync_report"))
+    added = [x for x in ("ft-1000", "ft-1001") if bt(x)]
+    check("H1 a line already loaded by hand is not added again", len(added) == 1, added)
+    check("H2 it is listed against the hand line", any(x.get("hand_line") == h1 for x in rep.get("by_hand") or []),
+          rep.get("by_hand"))
+    check("H3 one hand line stands for one feed line (the second swipe goes in)", len(added) == 1 and bt("ft-1002"))
+    check("H4 not a failure", rep["status"] == "Completed", rep["status"])
+    frappe.db.sql("delete from `tabBank Transaction` where transaction_id in ('ft-1000','ft-1001','ft-1002')")
+    frappe.db.commit()
+    from bank_integration.feed.tools import catch_up as _cu
+
+    res = _cu("airwallex", str((now - timedelta(days=4)).date()), str(now.date()), dry_run=1, currencies="AUD")
+    check("H5 catch-up dry run counts lines loaded by hand and leaves them out",
+          res["by_hand_count"] == 1 and {x["id"] for x in res["would_add"]} >= {"ft-1002"}
+          and len([x for x in res["would_add"] if x["id"] in ("ft-1000", "ft-1001")]) == 1, (res["by_hand_count"], [x["id"] for x in res["would_add"]]))
+    frappe.db.sql("delete from `tabBank Transaction` where description='FT by hand'")
+    frappe.db.commit()
+
     # ---- L logging
     from bank_integration.feed.maintenance import counts, delete_logs_before, purge_job
 
@@ -498,6 +531,13 @@ def run():
     sk.lines += [sline(60, "acc-judo", now - timedelta(days=3))]
     sync_scheduled_transactions_skript(None, "Hourly")
     check("S3 Skript: a late-posted Judo line is picked up", bool(bt("ft-s60")))
+    hs = hand_line(accts["FT CBA"], (now - timedelta(days=1)).date(), 55.5)
+    frappe.db.commit()
+    sk.lines += [sline(70, "acc-cba", now - timedelta(days=1, hours=2), amt=-55.5)]
+    sync_scheduled_transactions_skript(None, "Hourly")
+    check("H6 Skript: a card line loaded by hand is not added again", not bt("ft-s70"))
+    frappe.db.sql("delete from `tabBank Transaction` where name=%s", hs)
+    frappe.db.commit()
     srep = json.loads(frappe.db.get_single_value("Skript Settings", "sync_report"))
     check("S4 Skript report per account", "Judo LOC 5803" in srep["accounts"], list(srep["accounts"]))
     frappe.db.commit()

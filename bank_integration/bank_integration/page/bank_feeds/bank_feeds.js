@@ -166,7 +166,8 @@ frappe.pages["bank-feeds"].on_page_load = function (wrapper) {
 							 <td class="n">${esc(String(x.amount ?? ""))}</td><td>${esc(x.description || "")}</td></tr>`).join("");
 						const unr = Object.entries(checked.unrouted || {}).map(([c, n]) => `${esc(c)} ${n}`).join(", ");
 						d.fields_dict.out.$wrapper.html(`
-							<p><b>${checked.count}</b> ${__("lines to add")}${unr ? ` &middot; ${__("not set up")}: ${unr}` : ""}</p>
+							<p><b>${checked.count}</b> ${__("lines to add")}${unr ? ` &middot; ${__("not set up")}: ${unr}` : ""}${
+								checked.by_hand_count ? ` &middot; <span title="${esc((checked.by_hand || []).slice(0, 50).map((x) => String(x.when || "").slice(0, 10) + " " + (x.amount ?? "") + " = " + x.hand_line).join("\n"))}">${checked.by_hand_count} ${__("already loaded by hand, left out")}</span>` : ""}</p>
 							${(checked.problems || []).map((x) => `<div class="bkf-prob">${esc(x)}</div>`).join("")}
 							${list ? `<div style="max-height:320px;overflow:auto"><table class="bkf-tbl">${list}</table></div>` : ""}`);
 						if (checked.count) d.set_primary_action(__("Add {0} lines", [checked.count]), () => add(args));
