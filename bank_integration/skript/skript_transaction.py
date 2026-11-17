@@ -7,7 +7,7 @@ failures kept and not skipped past, a stale lock taken over, every page read.
 import frappe
 from bank_integration.skript.api.skript_transactions_api import SkriptTransactions
 from bank_integration.skript.api.skript_base_api import SkriptAPIError
-from bank_integration.skript.skript_utils import map_skript_to_erpnext, format_datetime_for_skript_filter , parse_skript_to_system_timezone
+from bank_integration.skript.skript_utils import map_skript_to_erpnext, format_datetime_for_skript_filter, parse_skript_date, parse_skript_to_system_timezone
 from frappe.utils import get_datetime
 
 from bank_integration.bank_integration.doctype.bank_integration_log import bank_integration_log as bi_log
@@ -87,24 +87,32 @@ def fetch_window(api, from_dt, to_dt):
     return list(seen.values())
 
 
-def run_window(settings, from_dt, to_dt, dry_run=False):
-    """Bring in the Skript lines posted in the window that ERPNext lacks.
+def run_window(settings, from_dt, to_dt, dry_run=False, only_ids=None, add_unsure=None):
+    """Judge the Skript lines posted in the window that ERPNext has no id
+    for (feed/common.py Matcher) and add the NEW ones.
 
     Each line on its own savepoint; failures kept in the report. Lines on a
     Skript account with no ERPNext Bank Account are counted, not an error
     for the rest (before 17 Nov 26 one unmapped account stopped the lot).
+    only_ids / add_unsure as for Airwallex (catch-up apply).
     """
+    only = set(only_ids) if only_ids is not None else None
+    unsure_ok = set(add_unsure or [])
     report = {
         "window": [str(from_dt), str(to_dt)],
         "dry_run": bool(dry_run),
         "problems": [],
         "accounts": {},
         "failed": [],
-        "would_add": [],
-        "by_hand": [],
+        "lines": [],
+        "months": {},
         "created": 0,
     }
-    hand = common.HandLines()
+
+    def month(m, key):
+        bucket = report["months"].setdefault(m, {"by_id": 0, common.NEW: 0, common.THERE: 0, common.UNSURE: 0})
+        bucket[key] += 1
+
     account_map = {}
     names = {}
     for row in settings.accounts or []:
@@ -121,42 +129,60 @@ def run_window(settings, from_dt, to_dt, dry_run=False):
         api_url=settings.api_url,
         api_scope=settings.api_scope,
     )
-    lines = fetch_window(api, from_dt, to_dt)
+    lines = []
+    seen = set()
+    for a, b in common.slices(from_dt, to_dt):
+        for t in fetch_window(api, a, b):
+            if t.get("id") not in seen:
+                seen.add(t.get("id"))
+                lines.append(t)
     have = common.existing_ids([t.get("id") for t in lines])
-
-    for n, txn in enumerate(lines):
+    matcher = common.Matcher(own_ids=[t.get("id") for t in lines])
+    todo = []
+    for txn in lines:
         acc = txn.get("accountId")
         label = names.get(acc) or acc or "none"
         part = report["accounts"].setdefault(label, {
             "bank_account": account_map.get(acc), "fetched": 0, "existing": 0,
             "created": 0, "failed": 0, "unmapped": 0, "last_posted": None,
+            common.NEW: 0, common.THERE: 0, common.UNSURE: 0,
         })
         part["fetched"] += 1
         posted = txn.get("postingDateTime")
         if posted and (not part["last_posted"] or str(posted) > str(part["last_posted"])):
             part["last_posted"] = posted
+        bank_account = account_map.get(acc)
+        day = str(frappe.utils.getdate(parse_skript_date(posted)))
         if txn.get("id") in have:
             part["existing"] += 1
+            if bank_account:
+                month(day[:7], "by_id")
             continue
-        bank_account = account_map.get(acc)
         if not bank_account:
             part["unmapped"] += 1
             continue
-        brief = {
-            "id": txn.get("id"), "when": parse_skript_to_system_timezone(posted),
-            "amount": txn.get("amount"), "description": (txn.get("description") or "")[:120],
-            "bank_account": bank_account,
-        }
         amt = float(txn.get("amount") or 0)
-        twin = hand.match(bank_account, map_skript_to_erpnext(txn, bank_account).get("date"),
-                          amt if amt > 0 else 0, -amt if amt < 0 else 0)
-        if twin:
-            brief["hand_line"] = twin
-            report["by_hand"].append(brief)
-            part["by_hand"] = part.get("by_hand", 0) + 1
-            continue
-        if dry_run:
-            report["would_add"].append(brief)
+        matcher.add(txn.get("id"), bank_account, (txn.get("currency") or "AUD").upper(), day,
+                    amt if amt > 0 else 0, -amt if amt < 0 else 0)
+        todo.append((txn, part, bank_account, day))
+
+    verdicts = matcher.judge()
+    for n, (txn, part, bank_account, day) in enumerate(todo):
+        v = verdicts[txn.get("id")]
+        brief = {
+            "id": txn.get("id"), "when": parse_skript_to_system_timezone(txn.get("postingDateTime")),
+            "date": day, "amount": txn.get("amount"), "currency": (txn.get("currency") or "AUD").upper(),
+            "description": (txn.get("description") or "")[:120], "bank_account": bank_account,
+            "verdict": v["verdict"], "line": v["line"], "line_info": v.get("line_info"),
+            "candidates": v["candidates"], "adopt": v.get("adopt", False), "why": v.get("why"),
+        }
+        part[v["verdict"]] += 1
+        month(day[:7], v["verdict"])
+        report["lines"].append(brief)
+        wanted = only is None or txn.get("id") in only
+        add = (v["verdict"] == common.NEW and wanted) or (
+            v["verdict"] == common.UNSURE and txn.get("id") in unsure_ok)
+        if dry_run or not add:
             continue
         try:
             doc = map_skript_to_erpnext(txn, bank_account)
@@ -171,8 +197,10 @@ def run_window(settings, from_dt, to_dt, dry_run=False):
                     frappe.db.commit()
                 continue
         part["failed"] += 1
-        brief["reason"] = fail
+        brief = dict(brief, reason=fail)
         report["failed"].append(brief)
+    if not dry_run:
+        report["lines"] = [x for x in report["lines"] if x["verdict"] != common.NEW][:200]
     return report
 
 
@@ -235,7 +263,7 @@ def sync_scheduled_transactions_skript(setting_name=None, schedule_type=None, fo
     status = "Failed"
     try:
         first_days = {"Hourly": 1, "Daily": 2, "Weekly": 8, "Monthly": 31}.get(schedule_type, 1)
-        from_dt = common.window_start(settings.get(CURSOR_F), first_days)
+        from_dt = common.window_start(settings.get(CURSOR_F), first_days, settings.get("reconciled_to"))
         report = run_window(settings, from_dt, started)
         status = "Completed with Errors" if report["failed"] else "Completed"
         cursor = common.next_cursor(started, report["failed"], settings.get(CURSOR_F))

@@ -24,6 +24,7 @@ class SkriptSettings(Document):
 		enable_log: DF.Check
 		enabled: DF.Check
 		last_sync_date: DF.Datetime | None
+		reconciled_to: DF.Date | None
 		sync_report: DF.LongText | None
 		sync_schedule: DF.Literal["Hourly", "Daily", "Weekly", "Monthly"]
 		sync_started_on: DF.Datetime | None

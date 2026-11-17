@@ -70,6 +70,7 @@ def overview():
             "status": doc.sync_status,
             "started": doc.sync_started_on,
             "last_good": doc.last_sync_date,
+            "floor": doc.get("reconciled_to"),
             "report": {
                 "run": rep.get("run"),
                 "ended": rep.get("ended"),

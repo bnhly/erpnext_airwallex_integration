@@ -92,10 +92,13 @@ class FinancialTransactions(AirwallexBase):
             if data.get("page_after"):
                 cursor = data["page_after"]
                 continue
-            if data.get("has_more") or (data.get("has_more") is None and len(items) >= size):
-                page_num += 1
-                continue
-            return
+            # has_more False is the end. When the reply does not say, ask for
+            # the next page anyway: a short page is not proof of the end if
+            # Airwallex caps page_size below what was asked. A page with
+            # nothing new stops it (above).
+            if data.get("has_more") is False:
+                return
+            page_num += 1
         raise AirwallexAPIError(
             f"Stopped after {self.MAX_PAGES} pages; narrow the date range", 500
         )

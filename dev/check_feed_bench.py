@@ -72,6 +72,8 @@ class FakeAirwallex:
                 return FakeResp(200, {"items": chunk, "page_after": nxt})
             num = int(p.get("page_num") or 0)
             chunk = rows[num * size:(num + 1) * size]
+            if getattr(self, "no_has_more", False):
+                return FakeResp(200, {"items": chunk})
             return FakeResp(200, {"items": chunk, "has_more": (num + 1) * size < len(rows)})
         if "spend/expenses" in url:
             return FakeResp(200, {"items": [], "page_after": None})
@@ -358,38 +360,155 @@ def run():
     awx.style = "has_more"
     awx.page_size_cap = None
 
-    # ---- H lines loaded by hand are not added a second time
-    def hand_line(ba, day, wd):
+    # ---- H what is "missing": NEW / ALREADY THERE / UNSURE (FY26 reconciliation rules)
+    from datetime import datetime as _dt
+
+    def made_line(ba, day, amount, tid=None, cur="AUD", submit=True, matched=False, cancel=False):
         d = frappe.get_doc({"doctype": "Bank Transaction", "bank_account": ba, "date": day,
-                            "withdrawal": wd, "deposit": 0, "currency": "AUD", "description": "FT by hand"})
+                            "withdrawal": -amount if amount < 0 else 0, "deposit": amount if amount > 0 else 0,
+                            "currency": cur, "description": "FT existing", "transaction_id": tid})
         d.insert(ignore_permissions=True)
-        d.submit()
+        if submit:
+            d.submit()
+        if matched:
+            frappe.db.set_value("Bank Transaction", d.name, {"allocated_amount": abs(amount), "unallocated_amount": 0,
+                                                             "status": "Reconciled"}, update_modified=False)
+        if cancel:
+            d.cancel()
         return d.name
 
-    frappe.db.sql("delete from `tabBank Transaction` where description='FT by hand'")
-    h1 = hand_line(accts["FT AWX AUD"], (now - timedelta(days=3)).date(), 77.7)
-    frappe.db.commit()
-    awx.lines.append(line(1000, now - timedelta(days=2), net=-77.7))   # same amount, a day off: the hand line
-    awx.lines.append(line(1001, now - timedelta(days=2, hours=1), net=-77.7))   # a second swipe of 77.70: real
-    awx.lines.append(line(1002, now - timedelta(days=2), net=-77.8))   # other amount: real
-    sync_scheduled_transactions(None, "Hourly")
-    rep = json.loads(frappe.db.get_single_value("Airwallex Settings", "sync_report"))
-    added = [x for x in ("ft-1000", "ft-1001") if bt(x)]
-    check("H1 a line already loaded by hand is not added again", len(added) == 1, added)
-    check("H2 it is listed against the hand line", any(x.get("hand_line") == h1 for x in rep.get("by_hand") or []),
-          rep.get("by_hand"))
-    check("H3 one hand line stands for one feed line (the second swipe goes in)", len(added) == 1 and bt("ft-1002"))
-    check("H4 not a failure", rep["status"] == "Completed", rep["status"])
-    frappe.db.sql("delete from `tabBank Transaction` where transaction_id in ('ft-1000','ft-1001','ft-1002')")
-    frappe.db.commit()
-    from bank_integration.feed.tools import catch_up as _cu
+    def at(day, hour=12):
+        return _dt(*map(int, day.split("-")), hour)
 
-    res = _cu("airwallex", str((now - timedelta(days=4)).date()), str(now.date()), dry_run=1, currencies="AUD")
-    check("H5 catch-up dry run counts lines loaded by hand and leaves them out",
-          res["by_hand_count"] == 1 and {x["id"] for x in res["would_add"]} >= {"ft-1002"}
-          and len([x for x in res["would_add"] if x["id"] in ("ft-1000", "ft-1001")]) == 1, (res["by_hand_count"], [x["id"] for x in res["would_add"]]))
-    frappe.db.sql("delete from `tabBank Transaction` where description='FT by hand'")
+    frappe.db.sql("delete from `tabBank Transaction` where description='FT existing' or transaction_id like 'st-%%'")
+    AUD, USD = accts["FT AWX AUD"], accts["FT AWX USD"]
+    ex = {
+        "hand": made_line(AUD, "2026-05-20", -1000.0),                    # statement import, no id
+        "other_id": made_line(AUD, "2026-05-21", -279.0, tid="old-feed-1"),  # feed made it under another id
+        "blank": made_line(None, "2026-05-22", -268.0),                    # C7 row, no bank account, AUD
+        "blank_usd": made_line(None, "2026-05-22", -268.0, cur="USD"),     # same amount, other currency: not a candidate
+        "draft": made_line(AUD, "2026-05-23", -101.65, submit=False),      # draft counts
+        "two_a": made_line(AUD, "2026-05-26", -108.9), "two_b": made_line(AUD, "2026-05-26", -108.9),
+        "spare_a": made_line(AUD, "2026-05-27", -15.0), "spare_b": made_line(AUD, "2026-05-28", -15.0),
+        "matched": made_line(AUD, "2026-05-24", 6000.0, matched=True),
+        "cancelled": made_line(AUD, "2026-08-16", -279.0, cancel=True),   # cancelled: does not count
+        "far": made_line(AUD, "2026-07-20", -137.04),                     # 8 days away: not a candidate
+    }
     frappe.db.commit()
+    st = [  # (id, date, amount): feed lines with no id in ERPNext
+        ("st-hand", "2026-05-20", -1000.0), ("st-other", "2026-05-21", -279.0), ("st-blank", "2026-05-22", -268.0),
+        ("st-draft", "2026-05-24", -101.65), ("st-two1", "2026-05-26", -108.9), ("st-two2", "2026-05-26", -108.9),
+        ("st-spare", "2026-05-27", -15.0), ("st-matched", "2026-05-24", 6000.0),
+        # genuine misses from the statement check
+        ("st-fee", "2026-08-16", -279.0), ("st-c1", "2026-07-28", -137.04), ("st-c2", "2026-08-03", -204.9),
+        ("st-c3", "2026-08-11", -56.95), ("st-c4", "2026-08-11", -15.1),
+    ]
+    for tid, day, amt in st:
+        awx.lines.append({"id": tid, "created_at": iso(at(day)), "currency": "AUD", "net": amt, "amount": amt,
+                          "transaction_type": "ISSUING_CAPTURE", "source_type": "CARD_PURCHASE", "source_id": "s" + tid,
+                          "status": "SETTLED", "description": tid, "batch_id": "b"})
+    awx.lines.append({"id": "st-gbp", "created_at": iso(at("2026-06-01")), "currency": "GBP", "net": -5.0, "amount": -5.0,
+                      "transaction_type": "FEE", "source_type": "FEE", "source_id": "x", "status": "SETTLED",
+                      "description": "gbp", "batch_id": "b"})
+    from bank_integration.feed.tools import catch_up as _cu, possible_doubles
+
+    res = _cu("airwallex", "2026-05-01", "2026-08-31", dry_run=1, currencies="AUD, USD")
+    v = {x["id"]: x for x in res["lines"]}
+    def vd(i):
+        return v.get(i, {}).get("verdict")
+    check("H1 a statement-imported line is ALREADY THERE", vd("st-hand") == "ALREADY THERE" and v["st-hand"]["line"] == ex["hand"], v.get("st-hand"))
+    check("H2 a line the feed made under another id is ALREADY THERE", vd("st-other") == "ALREADY THERE" and v["st-other"]["line"] == ex["other_id"])
+    check("H3 a blank Bank Account line in the same currency is ALREADY THERE", vd("st-blank") == "ALREADY THERE" and v["st-blank"]["line"] == ex["blank"], v.get("st-blank"))
+    check("H4 a draft counts", vd("st-draft") == "ALREADY THERE")
+    check("H5 two equal lines, two existing: both ALREADY THERE, one each",
+          vd("st-two1") == vd("st-two2") == "ALREADY THERE" and {v["st-two1"]["line"], v["st-two2"]["line"]} == {ex["two_a"], ex["two_b"]})
+    check("H6 one line, two existing that could be it: UNSURE", vd("st-spare") == "UNSURE", v.get("st-spare"))
+    check("H7 the statement's genuine misses are NEW (fee 279.00, 137.04, 204.90, 56.95, 15.10)",
+          all(vd(i) == "NEW" for i in ("st-fee", "st-c1", "st-c2", "st-c3", "st-c4")), {i: vd(i) for i in ("st-fee", "st-c1", "st-c2", "st-c3", "st-c4")})
+    check("H8 GBP left out, counted as not set up", res["unrouted"].get("GBP") == 1 and "st-gbp" not in v, res["unrouted"])
+    mm = {m["month"]: m for m in res["months"]}
+    check("H9 totals by month", mm["2026-05"]["ALREADY THERE"] == 7 and mm["2026-05"]["UNSURE"] == 1
+          and mm["2026-08"]["NEW"] == 4 and mm["2026-07"]["NEW"] == 1, res["months"])
+    check("H10 Adopt offered only where safe", v["st-hand"]["adopt"] and not v["st-other"]["adopt"]
+          and not v["st-blank"]["adopt"] and not v["st-matched"]["adopt"] and not v["st-spare"]["adopt"],
+          {i: (v[i]["adopt"], v[i]["why"]) for i in ("st-hand", "st-other", "st-blank", "st-matched", "st-spare")})
+
+    # the read-only check script's rule, run on the same data, gives the same answer
+    def script_rule(lines):
+        claimed, out = set(), {}
+        for tid, day, amt in sorted(lines, key=lambda x: x[1]):
+            col = "withdrawal" if amt < 0 else "deposit"
+            rows = frappe.db.sql(f"""select name, docstatus from `tabBank Transaction`
+                where {col} = %s and (bank_account = %s or (ifnull(bank_account,'') = '' and currency = 'AUD'))
+                and date between date_sub(%s, interval 3 day) and date_add(%s, interval 3 day)
+                and ifnull(transaction_id,'') not like 'st-%%'
+                order by abs(datediff(date, %s)), docstatus""", (abs(amt), AUD, day, day, day), as_dict=True)
+            live = [r for r in rows if r.docstatus < 2 and r.name not in claimed]
+            if live:
+                claimed.add(live[0].name)
+                out[tid] = "THERE"
+            else:
+                out[tid] = "ADD"
+        return out
+    ref = script_rule(st)
+    mine = {i: ("ADD" if vd(i) == "NEW" else "THERE") for i, _, _ in st}
+    check("H11 same answer as tm_fy26_awx_catchup_check (ALREADY THERE or UNSURE = THERE, NEW = ADD)",
+          ref == mine, {i: (ref[i], mine[i]) for i in ref if ref[i] != mine[i]})
+
+    # apply: NEW only, UNSURE only when ticked, adopt writes the id and nothing else
+    from bank_integration.feed.tools import catch_up_job as _job
+
+    before = frappe.db.get_value("Bank Transaction", ex["hand"], ["modified", "status", "date", "withdrawal"], as_dict=True)
+    _job("airwallex", "2026-05-01 00:00:00", "2026-09-01 00:00:00", currencies="AUD,USD",
+         add=None, add_unsure=[], adopt={"st-hand": ex["hand"], "st-other": ex["other_id"]}, by="check")
+    after = frappe.db.get_value("Bank Transaction", ex["hand"], ["modified", "status", "date", "withdrawal", "transaction_id"], as_dict=True)
+    check("H12 NEW lines added", all(bt(i) for i in ("st-fee", "st-c1", "st-c2", "st-c3", "st-c4")))
+    check("H13 ALREADY THERE and UNSURE not added", not any(bt(i) and bt(i).name not in ex.values()
+          for i in ("st-hand", "st-blank", "st-draft", "st-two1", "st-spare")))
+    check("H14 adopt writes the id only", after.transaction_id == "st-hand" and after.modified == before.modified
+          and after.status == before.status and str(after.date) == str(before.date) and after.withdrawal == before.withdrawal, (before, after))
+    check("H15 adopt refused on a line with another id",
+          frappe.db.get_value("Bank Transaction", ex["other_id"], "transaction_id") == "old-feed-1")
+    rep = json.loads(frappe.db.get_single_value("Airwallex Settings", "sync_report"))
+    check("H16 the refusal is reported", any(x["id"] == "st-other" for x in rep.get("adopt_refused") or []), rep.get("adopt_refused"))
+    _job("airwallex", "2026-05-01 00:00:00", "2026-09-01 00:00:00", currencies="AUD", add=[], add_unsure=["st-spare"], adopt={}, by="check")
+    check("H17 an UNSURE line goes in only when ticked", bool(bt("st-spare")))
+    res = _cu("airwallex", "2026-05-01", "2026-08-31", dry_run=1, currencies="AUD")
+    check("H18 nothing NEW left, adopted line now in by id",
+          res["counts"]["NEW"] == 0 and not any(x["id"] == "st-hand" for x in res["lines"]), res["counts"])
+    d = possible_doubles(AUD, "2026-05-01", "2026-05-31")
+    check("H19 possible doubles lists a feed line next to an equal line", d["possible_doubles"] >= 1, d)
+
+    # floor: never before Reconciled Up To
+    frappe.db.set_single_value("Airwallex Settings", "reconciled_to", "2026-06-30", update_modified=False)
+    frappe.db.commit()
+    try:
+        _cu("airwallex", "2026-05-01", "2026-08-31", dry_run=1)
+        refused = False
+    except frappe.ValidationError:
+        refused = True
+    check("H20 a From on or before Reconciled Up To is refused", refused)
+    res = _cu("airwallex", None, "2026-08-31", dry_run=1, currencies="AUD")
+    check("H21 no From = the day after Reconciled Up To", res["from"].startswith("2026-07-01"), res["from"])
+    from bank_integration.feed import common as _c
+
+    check("H22 the scheduled window never starts before it either",
+          _c.window_start("2026-07-02 00:00:00", 1, "2026-06-30") >= frappe.utils.get_datetime("2026-07-01"))
+    frappe.db.set_single_value("Airwallex Settings", "reconciled_to", None, update_modified=False)
+    frappe.db.sql("delete from `tabBank Transaction` where description='FT existing' or transaction_id like 'st-%%'")
+    awx.lines = [x for x in awx.lines if not str(x["id"]).startswith("st-")]
+    frappe.db.commit()
+
+    # paging when Airwallex caps the page and does not say has_more
+    awx.page_size_cap = 5
+    awx.no_has_more = True
+    awx.lines += [line(1100 + i, now - timedelta(days=20, minutes=i)) for i in range(12)]
+    res = _cu("airwallex", str((now - timedelta(days=21)).date()), str((now - timedelta(days=19)).date()), dry_run=1, currencies="AUD")
+    check("H23 every page read when Airwallex caps the page and gives no has_more",
+          {f"ft-{1100 + i}" for i in range(12)} <= {x["id"] for x in res["lines"]}, len(res["lines"]))
+    awx.page_size_cap = None
+    awx.no_has_more = False
+    awx.lines = [x for x in awx.lines if not (str(x["id"]).startswith("ft-11") and len(x["id"]) == 7)]
 
     # ---- L logging
     from bank_integration.feed.maintenance import counts, delete_logs_before, purge_job
@@ -458,13 +577,13 @@ def run():
                   line(902, now - timedelta(days=100))]
     frappe.db.commit()
     res = catch_up("airwallex", str((now - timedelta(days=210)).date()), str(now.date()), dry_run=1, currencies="AUD")
-    ids = {x["id"] for x in res["would_add"]}
+    ids = {x["id"] for x in res["lines"] if x["verdict"] == "NEW"}
     check("C1 dry run lists the missing AUD lines only", ids == {"ft-900", "ft-902"}, ids)
     check("C2 dry run writes nothing", not bt("ft-900"))
     catch_up_job("airwallex", str(now - timedelta(days=210)), str(now), currencies="AUD", by="check")
     check("C3 catch-up adds them", bt("ft-900") and bt("ft-902") and not bt("ft-901"))
     res = catch_up("airwallex", str((now - timedelta(days=210)).date()), str(now.date()), dry_run=1, currencies="AUD")
-    check("C4 nothing left to add, never twice", res["count"] == 0, res["count"])
+    check("C4 nothing left to add, never twice", res["counts"]["NEW"] == 0, res["counts"])
 
     # ---- F feed check
     fc = feed_check(txn="ft-900", ask_airwallex=1)
@@ -531,12 +650,13 @@ def run():
     sk.lines += [sline(60, "acc-judo", now - timedelta(days=3))]
     sync_scheduled_transactions_skript(None, "Hourly")
     check("S3 Skript: a late-posted Judo line is picked up", bool(bt("ft-s60")))
-    hs = hand_line(accts["FT CBA"], (now - timedelta(days=1)).date(), 55.5)
+    hs = made_line(accts["FT CBA"], (now - timedelta(days=1)).date(), -55.5)
     frappe.db.commit()
     sk.lines += [sline(70, "acc-cba", now - timedelta(days=1, hours=2), amt=-55.5)]
     sync_scheduled_transactions_skript(None, "Hourly")
-    check("H6 Skript: a card line loaded by hand is not added again", not bt("ft-s70"))
+    check("S5 Skript: a card line loaded by hand is not added again", not bt("ft-s70"))
     frappe.db.sql("delete from `tabBank Transaction` where name=%s", hs)
+    frappe.db.sql("delete from `tabBank Transaction` where description='FT existing'")
     frappe.db.commit()
     srep = json.loads(frappe.db.get_single_value("Skript Settings", "sync_report"))
     check("S4 Skript report per account", "Judo LOC 5803" in srep["accounts"], list(srep["accounts"]))

@@ -11,6 +11,7 @@
   "connection_column",
   "sync_schedule",
   "enable_log",
+  "reconciled_to",
   "clients_section",
   "clients",
   "filters_section",
@@ -114,10 +115,15 @@
    "label": "Last Run Report",
    "read_only": 1,
    "hidden": 1
+  },
+  {
+   "fieldname": "reconciled_to",
+   "fieldtype": "Date",
+   "label": "Reconciled Up To"
   }
  ],
  "links": [],
- "modified": "2026-11-17 13:00:00.000000",
+ "modified": "2026-11-17 18:00:00.000000",
  "modified_by": "Administrator",
  "module": "Bank Integration",
  "name": "Airwallex Settings",

@@ -79,12 +79,31 @@ def release_lock(dt, status):
 
 # ---------------------------------------------------------------- window
 
-def window_start(last_good, first_run_days):
-    """Start of the window to ask for: last good run less LOOKBACK_DAYS."""
+def window_start(last_good, first_run_days, floor=None):
+    """Start of the window to ask for: last good run less LOOKBACK_DAYS,
+    never on or before the reconciled-up-to date (floor)."""
     now = now_datetime()
     if last_good:
-        return get_datetime(last_good) - timedelta(days=LOOKBACK_DAYS)
-    return now - timedelta(days=max(first_run_days, LOOKBACK_DAYS))
+        start = get_datetime(last_good) - timedelta(days=LOOKBACK_DAYS)
+    else:
+        start = now - timedelta(days=max(first_run_days, LOOKBACK_DAYS))
+    if floor:
+        start = max(start, get_datetime(floor) + timedelta(days=1))
+    return start
+
+
+SLICE_DAYS = 31
+
+
+def slices(from_dt, to_dt):
+    """The range in pieces of SLICE_DAYS, for the bank's list calls. Lines
+    are judged once over the whole range, not per piece."""
+    cur = get_datetime(from_dt)
+    end = get_datetime(to_dt)
+    while cur < end:
+        nxt = min(cur + timedelta(days=SLICE_DAYS), end)
+        yield cur, nxt
+        cur = nxt
 
 
 def next_cursor(run_started, failures, old_cursor):
@@ -142,63 +161,129 @@ def existing_ids(ids):
     return found
 
 
-HAND_DAYS = 3
+NEAR_DAYS = 3
+NEW, THERE, UNSURE = "NEW", "ALREADY THERE", "UNSURE"
 
 
-class HandLines:
-    """Bank lines made by hand (no transaction_id): statement imports and the
-    register's scripts. A feed line with the same bank account, amount and
-    direction within HAND_DAYS of one of them is taken to be that line and is
-    NOT added again; it is listed in the run report instead. Each hand line
-    stands for one feed line only. Cancelled hand lines do not count.
+class Matcher:
+    """Decides whether a bank line the feed has (and ERPNext has no line with
+    its transaction_id) is really missing.
 
-    Added 17 Nov 26: the look-back window and catch-up would otherwise bring
-    in a second copy of lines that were loaded by hand while the feed was
-    broken (CBA credit card lines F6, the Airwallex fee C6).
+    A feed line is ALREADY THERE when a live Bank Transaction (draft or
+    submitted, not cancelled) of the same amount and direction sits within
+    NEAR_DAYS of it, on its Bank Account or on no Bank Account in the same
+    currency, whatever that line's transaction_id (a statement import, a hand
+    entry, a line the feed made under another id, the C7 rows). Lines that
+    carry an id fetched in this run belong to their own feed line and are
+    not offered. Each existing line is claimed once, nearest date first,
+    feed lines taken in date order.
+
+    Verdicts: NEW (no candidate), ALREADY THERE (a line was claimed and no
+    spare candidate is left over), UNSURE (claimed, but another candidate
+    was left unclaimed, so it could be either).
+
+    Rules from the FY26 reconciliation (17 Nov 26); the read-only check
+    accounts/tm_fy26_awx_catchup_check.py in erp_client_server sorts lines
+    the same way.
     """
 
-    def __init__(self):
-        self.pool = {}
-        self.taken = set()
+    def __init__(self, own_ids=()):
+        self.own = {i for i in own_ids if i}
+        self.items = []
 
-    def _load(self, bank_account, day):
-        from frappe.utils import add_days, getdate
+    def add(self, key, bank_account, currency, day, deposit, withdrawal):
+        from frappe.utils import flt, getdate
 
-        key = (bank_account, str(getdate(day))[:7])
-        if key in self.pool:
-            return self.pool[key]
-        d = getdate(day)
+        self.items.append({
+            "key": key, "bank_account": bank_account, "currency": currency,
+            "day": getdate(day), "deposit": round(flt(deposit), 2), "withdrawal": round(flt(withdrawal), 2),
+        })
+
+    def _candidates(self, it):
+        from frappe.utils import add_days
+
+        col = "deposit" if it["deposit"] else "withdrawal"
+        amt = it[col]
         rows = frappe.db.sql(
-            """select name, date, deposit, withdrawal from `tabBank Transaction`
-               where bank_account=%s and docstatus<2 and ifnull(transaction_id,'')=''
-                 and date between %s and %s""",
-            (bank_account, add_days(d.replace(day=1), -HAND_DAYS - 1),
-             add_days(d.replace(day=28), HAND_DAYS + 5)),
+            f"""select name, date, docstatus, status, ifnull(transaction_id, '') tid,
+                       ifnull(bank_account, '') bank_account, description,
+                       ifnull(allocated_amount, 0) allocated
+                from `tabBank Transaction`
+                where docstatus < 2 and {col} = %(amt)s
+                  and ifnull({'withdrawal' if col == 'deposit' else 'deposit'}, 0) = 0
+                  and (bank_account = %(ba)s
+                       or (ifnull(bank_account, '') = '' and currency = %(cur)s))
+                  and date between %(d0)s and %(d1)s""",
+            {"amt": amt, "ba": it["bank_account"], "cur": it["currency"],
+             "d0": add_days(it["day"], -NEAR_DAYS), "d1": add_days(it["day"], NEAR_DAYS)},
             as_dict=True,
         )
-        self.pool[key] = rows
+        rows = [r for r in rows if not (r.tid and r.tid in self.own)]
+        rows.sort(key=lambda r: (abs((r.date - it["day"]).days), r.docstatus, r.name))
         return rows
 
-    def match(self, bank_account, day, deposit, withdrawal):
-        """Name of the hand line this feed line duplicates, or None."""
-        from frappe.utils import date_diff, flt, getdate
+    def judge(self):
+        """{key: {verdict, line, line_info, candidates, adopt, why}}"""
+        claimed = set()
+        out = {}
+        order = sorted(self.items, key=lambda i: (i["day"], i["key"] or ""))
+        for it in order:
+            cands = self._candidates(it)
+            free = [c for c in cands if c.name not in claimed]
+            res = {"candidates": [c.name for c in free], "line": None}
+            if free:
+                pick = free[0]
+                claimed.add(pick.name)
+                res["line"] = pick.name
+                res["line_info"] = {
+                    "date": str(pick.date), "bank_account": pick.bank_account or None,
+                    "transaction_id": pick.tid or None, "status": ("Draft " if pick.docstatus == 0 else "") + str(pick.status or ""),
+                    "description": (pick.description or "")[:60], "matched": bool(pick.allocated),
+                }
+            out[it["key"]] = res
+        for it in order:
+            res = out[it["key"]]
+            if not res["line"]:
+                res["verdict"] = NEW
+                continue
+            spare = [c for c in res["candidates"] if c != res["line"] and c not in claimed]
+            res["verdict"] = UNSURE if spare else THERE
+            info = res["line_info"]
+            why = None
+            if res["verdict"] != THERE or len(res["candidates"]) != 1:
+                why = "more than one line could be it"
+            elif not info["bank_account"]:
+                why = "the line has no Bank Account (ask before setting one)"
+            elif info["transaction_id"]:
+                why = "the line already carries another id"
+            elif info["matched"]:
+                why = "the line is matched in Bank Reconciliation"
+            res["adopt"] = why is None
+            res["why"] = why
+        return out
 
-        if not (bank_account and day):
-            return None
-        dep, wd = round(flt(deposit), 2), round(flt(withdrawal), 2)
-        best = None
-        for r in self._load(bank_account, day):
-            if r.name in self.taken:
-                continue
-            if round(flt(r.deposit), 2) != dep or round(flt(r.withdrawal), 2) != wd:
-                continue
-            gap = abs(date_diff(getdate(r.date), getdate(day)))
-            if gap <= HAND_DAYS and (best is None or gap < best[0]):
-                best = (gap, r.name)
-        if best:
-            self.taken.add(best[1])
-            return best[1]
-        return None
+
+def adopt_line(line, transaction_id):
+    """Write the feed's id onto an existing line so later runs skip it.
+
+    Nothing else changes: not the amount, date, status, Bank Account or any
+    match. Refused when the line moved since it was judged."""
+    row = frappe.db.get_value(
+        "Bank Transaction", line,
+        ["docstatus", "transaction_id", "bank_account", "allocated_amount"], as_dict=True, for_update=True,
+    )
+    if not row or row.docstatus == 2:
+        return "the line is gone or cancelled"
+    if row.transaction_id:
+        return "the line already carries an id"
+    if not row.bank_account:
+        return "the line has no Bank Account"
+    if (row.allocated_amount or 0) > 0:
+        return "the line is matched in Bank Reconciliation"
+    if frappe.db.exists("Bank Transaction", {"transaction_id": transaction_id}):
+        return "another line already carries this id"
+    frappe.db.set_value("Bank Transaction", line, "transaction_id", transaction_id, update_modified=False)
+    return None
 
 
 def insert_line(doc_dict, sp_name):

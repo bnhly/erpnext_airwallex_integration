@@ -116,3 +116,42 @@ four digits; after TM, job, project or # it may be shorter. Nothing else the
 importer makes has changed. If a site rule refuses the project, the invoice
 is made without it and the remarks say why. The import summary counts how
 many got a project. Check: `dev/check_expense_project_bench.py`.
+
+## Catch up decides "missing" properly (17 Nov 2026, from the FY26 reconciliation)
+
+The first Catch up offered 183 Airwallex lines from 8 Oct 2025, most of them
+already in ERPNext without an Airwallex id. Now a line the bank has, with no
+ERPNext line carrying its id, is judged:
+
+- **ALREADY THERE**: a live line (draft or submitted, not cancelled) of the
+  same amount and direction within 3 days, on its Bank Account or on no Bank
+  Account in the same currency, whatever that line's id. Each existing line
+  stands for one bank line, nearest date first.
+- **UNSURE**: as above, but another line could equally be it.
+- **NEW**: nothing like it.
+
+The dry run shows each line's verdict, the line it matched, and totals by
+month (including lines already in by id, which shows where a month stands).
+Apply adds NEW lines only (all, or the ticked ones). UNSURE lines go in only
+when ticked. **Adopt** writes the bank's id onto an ALREADY THERE line with one
+candidate, so later runs skip it; nothing else on the line changes. Adopt is
+not offered for a line with no Bank Account (ask first), a line with another
+id, or a line matched in Bank Reconciliation. Every hourly run uses the same
+rule and adds only NEW lines.
+
+**Reconciled Up To** (on each provider's settings): Catch up refuses a From
+date on or before it and starts the day after by default; scheduled runs never
+reach back past it.
+
+Paging: when Airwallex does not say whether there are more pages, the next page
+is asked for anyway, until a page brings nothing new. The first Catch up
+probably stopped after the first page of each 31-day slice, which is why it
+offered no November lines.
+
+Read-only `bank_integration.feed.tools.possible_doubles?bank_account=AWX AUD&from_date=2026-11-01`
+lists pairs of equal lines within 3 days where one came from a feed, for
+checking lines added before this rule.
+
+Checks: `dev/check_feed_bench.py` H1 to H23 (every verdict, the genuine misses
+279.00, 137.04, 204.90, 56.95, 15.10 come out NEW, the same answer as
+tm_fy26_awx_catchup_check's rule, Adopt, the floor, paging).

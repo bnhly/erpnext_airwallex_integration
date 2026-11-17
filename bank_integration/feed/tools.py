@@ -19,15 +19,12 @@ Lines already in ERPNext (by transaction_id, cancelled ones included) are
 never added again.
 """
 
-from datetime import timedelta
-
 import frappe
 from frappe.utils import get_datetime, getdate
 
 from bank_integration.feed import common
 
 ROLES = ("System Manager", "Accounts Manager")
-SLICE_DAYS = 31
 
 
 def _allowed():
@@ -152,54 +149,95 @@ def feed_check(txn=None, ask_airwallex=0, errors_since="2026-10-25"):
     return out
 
 
-def _slices(from_dt, to_dt):
-    cur = from_dt
-    while cur < to_dt:
-        nxt = min(cur + timedelta(days=SLICE_DAYS), to_dt)
-        yield cur, nxt
-        cur = nxt
+def _range(settings, from_date, to_date):
+    """From the start of from_date to the end of to_date, never on or before
+    Reconciled Up To."""
+    floor = settings.get("reconciled_to")
+    from_dt = get_datetime(getdate(from_date)) if from_date else None
+    if floor and (not from_dt or getdate(from_dt) <= getdate(floor)):
+        if from_dt:
+            frappe.throw(
+                f"Reconciled up to {frappe.utils.formatdate(floor)}. Pick a From date after that, "
+                "or change Reconciled Up To in the settings."
+            )
+        from_dt = get_datetime(frappe.utils.add_days(getdate(floor), 1))
+    if not from_dt:
+        frappe.throw("From date is required")
+    to_dt = get_datetime(frappe.utils.add_days(getdate(to_date), 1)) if to_date else frappe.utils.now_datetime()
+    to_dt = min(to_dt, frappe.utils.now_datetime())
+    if to_dt <= from_dt:
+        frappe.throw("To must be after From")
+    return from_dt, to_dt
+
+
+def _run(provider, settings, a, b, dry, curs, only_ids=None, add_unsure=None):
+    if provider == "airwallex":
+        from bank_integration.airwallex.transaction import run_window
+
+        return run_window(settings, a, b, dry_run=dry, lookups=not dry, currencies=curs or None,
+                          only_ids=only_ids, add_unsure=add_unsure)
+    from bank_integration.skript.skript_transaction import run_window as skript_window
+
+    return skript_window(settings, a, b, dry_run=dry, only_ids=only_ids, add_unsure=add_unsure)
+
+
+def _ids(value):
+    import json
+
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    try:
+        out = json.loads(value)
+    except ValueError:
+        out = [x.strip() for x in str(value).split(",")]
+    return [x for x in out if x]
 
 
 @frappe.whitelist()
-def catch_up(provider, from_date, to_date=None, dry_run=1, confirm=None, currencies=None):
-    """List (dry run) or add the lines missing from a date range."""
+def catch_up(provider, from_date=None, to_date=None, dry_run=1, confirm=None, currencies=None,
+             add=None, add_unsure=None, adopt=None):
+    """Dry run: every line the bank has that ERPNext has no id for, each
+    judged NEW, ALREADY THERE (naming the line) or UNSURE, with totals by
+    month. Apply (dry_run=0, confirm=YES_ADD): adds the NEW lines (all, or
+    only those in `add`), UNSURE lines only when in `add_unsure`, and writes
+    the bank's id onto the ALREADY THERE lines in `adopt` ({id: line}).
+    Lines are judged again in the job, so nothing judged stale is added."""
     _allowed()
     provider = (provider or "").lower()
-    if provider not in ("airwallex", "skript"):
+    if provider not in common.DOCTYPE:
         frappe.throw("provider is airwallex or skript")
-    from_dt = get_datetime(from_date)
-    to_dt = get_datetime(to_date) if to_date else frappe.utils.now_datetime()
-    if to_dt <= from_dt:
-        frappe.throw("to_date must be after from_date")
+    settings = frappe.get_single(common.DOCTYPE[provider])
+    from_dt, to_dt = _range(settings, from_date, to_date)
     curs = [c.strip().upper() for c in str(currencies or "").split(",") if c.strip()]
 
     if str(dry_run) != "0":
-        settings = frappe.get_single(common.DOCTYPE[provider])
-        total = {"provider": provider, "dry_run": True, "would_add": [], "by_hand": [], "failed": [],
-                 "problems": [], "unrouted": {}, "slices": 0}
-        for a, b in _slices(from_dt, to_dt):
-            rep = _run(provider, settings, a, b, True, curs)
-            total["slices"] += 1
-            total["would_add"] += rep["would_add"]
-            total["by_hand"] += rep.get("by_hand") or []
-            total["failed"] += rep["failed"]
-            for p in rep.get("problems") or []:
-                if p not in total["problems"]:
-                    total["problems"].append(p)
-            for lg in rep.get("logins") or []:
-                for cur, n in lg.get("unrouted", {}).items():
-                    total["unrouted"][cur] = total["unrouted"].get(cur, 0) + n
-        total["count"] = len(total["would_add"])
-        total["by_hand_count"] = len(total["by_hand"])
-        total["by_bank_account"] = {}
-        for line in total["would_add"]:
-            key = line.get("bank_account")
-            total["by_bank_account"][key] = total["by_bank_account"].get(key, 0) + 1
-        total["next"] = "Check the list, then add &dry_run=0&confirm=YES_ADD to add them."
-        return total
+        rep = _run(provider, settings, from_dt, to_dt, True, curs)
+        counts = {common.NEW: 0, common.THERE: 0, common.UNSURE: 0}
+        for line in rep["lines"]:
+            counts[line["verdict"]] += 1
+        unrouted = {}
+        for lg in rep.get("logins") or []:
+            for cur, n in lg.get("unrouted", {}).items():
+                unrouted[cur] = unrouted.get(cur, 0) + n
+        unmapped = {k: v["unmapped"] for k, v in (rep.get("accounts") or {}).items() if v.get("unmapped")}
+        return {
+            "provider": provider, "dry_run": True,
+            "from": str(from_dt), "to": str(to_dt), "floor": str(settings.get("reconciled_to") or ""),
+            "counts": counts, "adoptable": sum(1 for x in rep["lines"] if x.get("adopt")),
+            "months": [dict(month=m, **v) for m, v in sorted(rep["months"].items())],
+            "lines": rep["lines"], "problems": rep.get("problems") or [], "failed": rep.get("failed") or [],
+            "unrouted": unrouted, "unmapped": unmapped,
+        }
 
     if confirm != "YES_ADD":
-        frappe.throw("To add the lines, add &confirm=YES_ADD as well as &dry_run=0.")
+        frappe.throw("To apply, add &confirm=YES_ADD as well as &dry_run=0.")
+    adopt_map = adopt
+    if isinstance(adopt_map, str):
+        import json
+
+        adopt_map = json.loads(adopt_map or "{}")
     frappe.enqueue(
         "bank_integration.feed.tools.catch_up_job",
         queue="long",
@@ -210,23 +248,16 @@ def catch_up(provider, from_date, to_date=None, dry_run=1, confirm=None, currenc
         from_date=str(from_dt),
         to_date=str(to_dt),
         currencies=",".join(curs),
+        add=_ids(add) if add is not None else None,
+        add_unsure=_ids(add_unsure),
+        adopt=adopt_map or {},
         by=frappe.session.user,
     )
-    return {"started": "Adding in the background. Run the dry run again to see what is left."}
+    return {"started": "Working in the background. Check again to see what is left."}
 
 
-def _run(provider, settings, a, b, dry, curs):
-    if provider == "airwallex":
-        from bank_integration.airwallex.transaction import run_window
-
-        return run_window(settings, a, b, dry_run=dry, lookups=not dry, currencies=curs or None)
-    from bank_integration.skript.skript_transaction import run_window as skript_window
-
-    return skript_window(settings, a, b, dry_run=dry)
-
-
-def catch_up_job(provider, from_date, to_date, currencies="", by=None):
-    """Background catch-up: the range in month slices, under the feed's lock."""
+def catch_up_job(provider, from_date, to_date, currencies="", add=None, add_unsure=None, adopt=None, by=None):
+    """Background catch-up under the feed's lock: adopt first, then add."""
     curs = [c for c in currencies.split(",") if c]
     dt = common.DOCTYPE[provider]
     from bank_integration.bank_integration.doctype.bank_integration_log import bank_integration_log as bi_log
@@ -239,20 +270,22 @@ def catch_up_job(provider, from_date, to_date, currencies="", by=None):
     if note:
         bi_log.create_log(note, status="Error", provider=provider.title())
     settings = frappe.get_single(dt)
-    added, failed, status = 0, [], "Failed"
+    status = "Failed"
     try:
-        for a, b in _slices(get_datetime(from_date), get_datetime(to_date)):
-            rep = _run(provider, settings, a, b, False, curs)
-            added += rep["created"]
-            failed += rep["failed"]
-            frappe.db.commit()
-        status = "Completed with Errors" if failed else "Completed"
-        report = {"run": "catch-up", "window": [from_date, to_date], "created": added,
-                  "failed": failed, "status": status, "by": by}
-        common.save_report(dt, report)
+        adopted, refused = [], []
+        for tid, line in (adopt or {}).items():
+            why = common.adopt_line(line, tid)
+            (refused if why else adopted).append({"id": tid, "line": line, "why": why})
+        frappe.db.commit()
+        rep = _run(provider, settings, get_datetime(from_date), get_datetime(to_date), False, curs,
+                   only_ids=add, add_unsure=add_unsure)
+        status = "Completed with Errors" if rep["failed"] or refused else "Completed"
+        rep.update({"run": "catch-up", "status": status, "by": by, "adopted": adopted, "adopt_refused": refused})
+        common.save_report(dt, rep)
         bi_log.create_log(
-            f"{provider.title()} catch-up {from_date} to {to_date}: {added} added, {len(failed)} failed",
-            status="Error" if failed else "Info",
+            f"{provider.title()} catch-up {from_date} to {to_date}: {rep['created']} added, "
+            f"{len(adopted)} adopted, {len(rep['failed'])} failed, {len(refused)} not adopted",
+            status="Error" if rep["failed"] or refused else "Info",
             provider=provider.title(),
         )
     except Exception:
@@ -260,3 +293,44 @@ def catch_up_job(provider, from_date, to_date, currencies="", by=None):
         frappe.log_error(frappe.get_traceback(), f"{provider.title()} catch-up failed")
     finally:
         common.release_lock(dt, status)
+
+
+@frappe.whitelist()
+def possible_doubles(bank_account, from_date, to_date=None):
+    """READ ONLY. Pairs of live lines on a Bank Account (or a blank one in its
+    currency) with the same amount and direction within 3 days, where at least
+    one was made by a feed (has a transaction_id). For checking lines a run
+    added before the full duplicate rule was in (17 Nov 26).
+
+      /api/method/bank_integration.feed.tools.possible_doubles?bank_account=AWX AUD&from_date=2026-11-01
+    """
+    _allowed()
+    acc = frappe.db.get_value("Bank Account", bank_account, "account")
+    cur = frappe.db.get_value("Account", acc, "account_currency") if acc else None
+    rows = frappe.db.sql(
+        """select name, date, deposit, withdrawal, ifnull(transaction_id,'') tid,
+                  ifnull(bank_account,'') bank_account, docstatus, status, creation,
+                  ifnull(allocated_amount,0) allocated, left(ifnull(description,''), 60) description
+           from `tabBank Transaction`
+           where docstatus < 2 and date between %s and %s
+             and (bank_account = %s or (ifnull(bank_account,'') = '' and currency = %s))
+           order by date, creation""",
+        (frappe.utils.add_days(getdate(from_date), -3),
+         frappe.utils.add_days(getdate(to_date or frappe.utils.nowdate()), 3), bank_account, cur),
+        as_dict=True,
+    )
+    pairs = []
+    for i, a in enumerate(rows):
+        for b in rows[i + 1:]:
+            if (b.date - a.date).days > 3:
+                break
+            if round(a.deposit, 2) == round(b.deposit, 2) and round(a.withdrawal, 2) == round(b.withdrawal, 2) \
+                    and (a.tid or b.tid):
+                pairs.append({
+                    "amount": a.deposit or -a.withdrawal,
+                    "first": {k: str(a[k]) for k in ("name", "date", "tid", "bank_account", "status", "creation", "description")},
+                    "second": {k: str(b[k]) for k in ("name", "date", "tid", "bank_account", "status", "creation", "description")},
+                    "matched": [x.name for x in (a, b) if x.allocated],
+                })
+    return {"bank_account": bank_account, "lines": len(rows), "possible_doubles": len(pairs), "pairs": pairs,
+            "note": "Two equal purchases close together are real too: check each pair against the statement."}

@@ -30,9 +30,10 @@ from frappe.utils import get_datetime, now_datetime
 
 from bank_integration.airwallex.api.base_api import AirwallexAPIError
 from bank_integration.airwallex.api.financial_transactions import FinancialTransactions
-from bank_integration.airwallex.utils import build_expense_merchant_index, map_airwallex_to_erpnext
+from bank_integration.airwallex.utils import build_expense_merchant_index, local_date, map_airwallex_to_erpnext
 from bank_integration.bank_integration.doctype.bank_integration_log import bank_integration_log as bi_log
 from bank_integration.feed import common
+from bank_integration.feed.common import NEW
 
 DT = common.AIRWALLEX
 CURSOR_F = common.CURSOR_F
@@ -83,14 +84,18 @@ def _short(cid):
 
 # ------------------------------------------------------------------ core run
 
-def run_window(settings, from_dt, to_dt, dry_run=False, lookups=True, currencies=None):
-    """Fetch every line in [from_dt, to_dt] for every login and bring in
-    the ones ERPNext does not have.
+def run_window(settings, from_dt, to_dt, dry_run=False, lookups=True, currencies=None,
+               only_ids=None, add_unsure=None):
+    """Fetch every line in [from_dt, to_dt] for every login, judge each line
+    ERPNext has no id for (feed/common.py Matcher), and add the NEW ones.
 
-    dry_run: nothing is written; the report lists what would be added.
+    dry_run: nothing is written; report["lines"] carries every judged line.
     lookups: fetch counterparty / merchant names (off for dry runs).
     currencies: only these currencies (catch-up); others are left alone.
-    Returns a report dict.
+    only_ids: add only these ids (catch-up apply), still only when NEW, or
+        UNSURE and in add_unsure.
+    Lines ALREADY THERE are never added. UNSURE lines are added only when
+    named in add_unsure (a tick on the Bank Feeds page).
     """
     from_iso = settings._to_iso8601(from_dt)
     to_iso = settings._to_iso8601(to_dt)
@@ -99,29 +104,30 @@ def run_window(settings, from_dt, to_dt, dry_run=False, lookups=True, currencies
         keep = {c.upper() for c in currencies}
         for login in logins:
             login["routes"] = {c: r for c, r in login["routes"].items() if c in keep}
+    only = set(only_ids) if only_ids is not None else None
+    unsure_ok = set(add_unsure or [])
     report = {
         "window": [str(from_dt), str(to_dt)],
         "dry_run": bool(dry_run),
         "problems": problems,
         "logins": [],
         "failed": [],
-        "would_add": [],
-        "by_hand": [],
+        "lines": [],
+        "months": {},
         "created": 0,
     }
-    hand = common.HandLines()
+
+    def month(m, key):
+        bucket = report["months"].setdefault(m, {"by_id": 0, NEW: 0, common.THERE: 0, common.UNSURE: 0})
+        bucket[key] += 1
 
     for login in logins:
         row = login["key_row"]
         part = {
             "client": _short(login["client_id"]),
             "routes": {cur: r.bank_account for cur, r in login["routes"].items()},
-            "fetched": 0,
-            "existing": 0,
-            "filtered": 0,
-            "created": 0,
-            "unrouted": {},
-            "failed": 0,
+            "fetched": 0, "existing": 0, "filtered": 0, "created": 0,
+            "unrouted": {}, "failed": 0, NEW: 0, common.THERE: 0, common.UNSURE: 0,
         }
         report["logins"].append(part)
         if not login["routes"]:
@@ -132,7 +138,14 @@ def run_window(settings, from_dt, to_dt, dry_run=False, lookups=True, currencies
                 api_key=row.get_password("airwallex_api_key"),
                 api_url=settings.api_url,
             )
-            lines = list(api.iter_all(from_created_at=from_iso, to_created_at=to_iso))
+            lines = []
+            seen = set()
+            for a, b in common.slices(from_dt, to_dt):
+                for t in api.iter_all(from_created_at=settings._to_iso8601(a),
+                                      to_created_at=settings._to_iso8601(b)):
+                    if t.get("id") not in seen:
+                        seen.add(t.get("id"))
+                        lines.append(t)
         except AirwallexAPIError as e:
             part["error"] = f"Airwallex said: {str(e.message)[:300]}"
             report["failed"].append({
@@ -142,57 +155,71 @@ def run_window(settings, from_dt, to_dt, dry_run=False, lookups=True, currencies
 
         part["fetched"] = len(lines)
         have = common.existing_ids([t.get("id") for t in lines])
+        matcher = common.Matcher(own_ids=[t.get("id") for t in lines])
         todo = []
         for txn in lines:
+            cur = (txn.get("currency") or "").upper()
+            day = local_date(txn.get("created_at"))
             if txn.get("id") in have:
                 part["existing"] += 1
+                if cur in login["routes"]:
+                    month(day[:7], "by_id")
                 continue
             ttype = (txn.get("transaction_type") or "").upper()
             if not settings.should_sync_transaction(ttype):
                 part["filtered"] += 1
                 continue
-            cur = (txn.get("currency") or "").upper()
             if cur not in login["routes"]:
                 part["unrouted"][cur or "none"] = part["unrouted"].get(cur or "none", 0) + 1
                 continue
+            net = float(txn.get("net") if txn.get("net") is not None else txn.get("amount") or 0)
+            matcher.add(txn.get("id"), login["routes"][cur].bank_account, cur, day,
+                        net if net > 0 else 0, -net if net < 0 else 0)
             todo.append(txn)
+
+        verdicts = matcher.judge()
+        to_add = []
+        for txn in todo:
+            v = verdicts[txn.get("id")]
+            target = login["routes"][(txn.get("currency") or "").upper()]
+            item = _brief(txn, target.bank_account)
+            item.update({"date": local_date(txn.get("created_at")), "verdict": v["verdict"], "line": v["line"],
+                         "line_info": v.get("line_info"), "candidates": v["candidates"],
+                         "adopt": v.get("adopt", False), "why": v.get("why")})
+            part[v["verdict"]] += 1
+            month(item["date"][:7], v["verdict"])
+            report["lines"].append(item)
+            wanted = only is None or txn.get("id") in only
+            if v["verdict"] == NEW and wanted:
+                to_add.append(txn)
+            elif v["verdict"] == common.UNSURE and txn.get("id") in unsure_ok:
+                to_add.append(txn)
+
+        if dry_run:
+            continue
 
         # Merchant names only when there is a new card line to name.
         expense_index = []
         issuing_cache = {}
-        if lookups and not dry_run and any(t.get("source_type") in CARD_TYPES for t in todo):
+        if lookups and any(t.get("source_type") in CARD_TYPES for t in to_add):
             expense_index = build_expense_merchant_index(row, settings.api_url, from_iso, to_iso)
 
-        for n, txn in enumerate(todo):
+        for n, txn in enumerate(to_add):
             target = login["routes"][(txn.get("currency") or "").upper()]
             fail = None
             try:
                 doc = map_airwallex_to_erpnext(
                     txn,
                     target.bank_account,
-                    client=target if (lookups and not dry_run) else None,
+                    client=target if lookups else None,
                     api_url=settings.api_url,
                     expense_index=expense_index,
                     issuing_cache=issuing_cache,
                 )
             except Exception as e:  # noqa: BLE001
                 doc, fail = None, common.clean_reason(e)
-
             if doc and not doc.get("bank_account"):
                 fail = f"No bank account for {txn.get('currency')} on {target.bank_account}"
-
-            if doc and not fail:
-                twin = hand.match(doc["bank_account"], doc.get("date"), doc.get("deposit"), doc.get("withdrawal"))
-                if twin:
-                    item = _brief(txn, target.bank_account)
-                    item["hand_line"] = twin
-                    report["by_hand"].append(item)
-                    part["by_hand"] = part.get("by_hand", 0) + 1
-                    continue
-
-            if dry_run and not fail:
-                report["would_add"].append(_brief(txn, target.bank_account))
-                continue
             if not fail:
                 name, fail = common.insert_line(doc, f"awx_line_{n}")
                 if name:
@@ -207,6 +234,9 @@ def run_window(settings, from_dt, to_dt, dry_run=False, lookups=True, currencies
             item["client"] = part["client"]
             report["failed"].append(item)
 
+    if not dry_run:
+        # Keep the stored report short: only what was not added and why.
+        report["lines"] = [x for x in report["lines"] if x["verdict"] != NEW][:200]
     return report
 
 
@@ -269,7 +299,7 @@ def sync_scheduled_transactions(setting_name=None, schedule_type=None, force=Fal
     status = "Failed"
     try:
         first_days = {"Hourly": 1, "Daily": 2, "Weekly": 8, "Monthly": 31}.get(schedule_type, 1)
-        from_dt = common.window_start(settings.get(CURSOR_F), first_days)
+        from_dt = common.window_start(settings.get(CURSOR_F), first_days, settings.get("reconciled_to"))
         report = run_window(settings, from_dt, started)
         status = _status_of(report)
         cursor = common.next_cursor(started, report["failed"], settings.get(CURSOR_F))
