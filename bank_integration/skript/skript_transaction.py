@@ -16,7 +16,7 @@ from bank_integration.feed import common
 
 DT = common.SKRIPT
 CURSOR_F = common.CURSOR_F
-PAGE_SIZE = 1000
+PAGE_SIZE = 100  # Skript refuses more: "The 'size' query param value cannot exceed 100"
 MAX_PAGES = 100
 
 

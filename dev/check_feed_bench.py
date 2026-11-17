@@ -111,6 +111,8 @@ class FakeSkript:
                     rows.append(t)
             rows.sort(key=lambda t: t["postingDateTime"])
             size = int((params or {}).get("size") or 100)
+            if size > 100:  # what Skript answers (seen live 18 Nov 26)
+                return FakeResp(400, [{"code": "ERR-001200", "message": "The 'size' query param value cannot exceed 100"}])
             if self.size_cap:
                 size = min(size, self.size_cap)
             return FakeResp(200, {"items": rows[:size]})
