@@ -64,14 +64,15 @@ All are GET calls in the browser while signed in. Read only unless it says.
    would go.
 2. Log count (read only):
    `/api/method/bank_integration.feed.maintenance.purge_logs?error_logs=1`
-3. Rotate the Airwallex API key in Airwallex, paste the new one into both
+3. Later, before step 4 (Ben, 17 Nov 26): rotate the Airwallex API key in Airwallex, paste the new one into both
    client rows, Save. (The old key sits in log rows readable by any System
    Manager.)
 4. Clear the logs (deletes, background, batches of 2,000):
    `...purge_logs?error_logs=1&dry_run=0&confirm=YES_DELETE`
-5. Catch-up dry run (reads Airwallex, writes nothing):
-   `/api/method/bank_integration.feed.tools.catch_up?provider=airwallex&from_date=2025-07-01&to_date=2026-11-17&currencies=AUD`
-   Compare with the 63 lines from the statement check.
+5. Catch-up dry run (reads Airwallex, writes nothing), AUD and USD (Ben,
+   17 Nov 26):
+   `/api/method/bank_integration.feed.tools.catch_up?provider=airwallex&from_date=2025-07-01&to_date=2026-11-17&currencies=AUD,USD`
+   Compare the AUD lines with the 63 from the statement check.
 6. Catch-up (adds lines, background): the same with `&dry_run=0&confirm=YES_ADD`.
 7. Skript the same way with `provider=skript` (Judo since 8 Jul 2026).
 

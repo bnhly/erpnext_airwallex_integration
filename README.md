@@ -1,5 +1,8 @@
 # Bank Integration - Airwallex to ERPNext
 
+Thrust Maritime's copy, maintained as our own (Ben, 17 Nov 2026). It started
+from Akhilam-Inc/erpnext_airwallex_integration (MIT) and no longer tracks it.
+
 Seamless integration between Airwallex and ERPNext for automatic financial transaction synchronization.
 
 ## Overview
@@ -25,7 +28,7 @@ You can install this app using the [bench](https://github.com/frappe/bench) CLI:
 
 ```bash
 cd $PATH_TO_YOUR_BENCH
-bench get-app https://github.com/Akhilam-Inc/erpnext_airwallex_integration --branch develop
+bench get-app https://github.com/bnhly/erpnext_airwallex_integration
 bench install-app bank_integration
 ```
 
