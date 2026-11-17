@@ -15,7 +15,7 @@ Behaviour
 - Idempotency is entirely local. A unique field custom_tm_airwallex_expense_id
   on Purchase Invoice plus an existence check prevents duplicates. The Airwallex
   sync_status field is never read or written, so this cannot conflict with Xero.
-- Triggered manually from the Bank Integration Setting form button.
+- Triggered by hand from the Import Airwallex button on the Purchase Invoice list.
 
 Card name gap
 - The expenses endpoint returns card_id (a UUID) but not the cardholder name.
@@ -286,9 +286,9 @@ def run_expense_import(from_date=None, to_date=None):
     """Import expenses in IMPORT_STATUSES (default APPROVED) created
     within the window into draft PIs. Expenses whose description carries
     a SKIP_DESCRIPTION_TAGS token (default ``#no_export``) are skipped."""
-    settings = frappe.get_single("Bank Integration Setting")
+    settings = frappe.get_single("Airwallex Settings")
 
-    if not getattr(settings, "airwallex_clients", None):
+    if not getattr(settings, "clients", None):
         bi_log.create_log("Expense import: no Airwallex clients configured", status="Error")
         return
 
@@ -303,7 +303,7 @@ def run_expense_import(from_date=None, to_date=None):
     skipped_tag_details = []
     # An Airwallex tenant returns the same Spend Expenses regardless of
     # which client credential you query with. Multiple Airwallex Client
-    # rows in Bank Integration Setting (usually one per ERPNext bank
+    # rows on Airwallex Settings (usually one per ERPNext bank
     # account currency) all hit the same Airwallex tenant, so without
     # this in-run dedup each expense would be processed once per client.
     seen_expense_ids = set()
@@ -314,13 +314,13 @@ def run_expense_import(from_date=None, to_date=None):
     # pull the clean merchant name and cardholder nickname for the PI
     # remarks. Lookups are cached so we don't re-hit Issuing for the same
     # source_id.
-    first_client = settings.airwallex_clients[0]
+    first_client = settings.clients[0]
     ft_index = _build_ft_index_for_card_txns(
         first_client, settings.api_url, from_iso, to_iso
     )
     issuing_cache = {}
 
-    for client in settings.airwallex_clients:
+    for client in settings.clients:
         try:
             api = Expenses(
                 client_id=client.airwallex_client_id,

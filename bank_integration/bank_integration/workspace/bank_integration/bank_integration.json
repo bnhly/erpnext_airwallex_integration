@@ -1,6 +1,6 @@
 {
  "charts": [],
- "content": "[{\"id\":\"Wcdj0-u1ZM\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\">Bank Integration</span>\",\"col\":12}},{\"id\":\"s24aob0YsU\",\"type\":\"spacer\",\"data\":{\"col\":12}},{\"id\":\"D5CMdkAJ93\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Bank Integration Setting\",\"col\":3}},{\"id\":\"puraCQwMz1\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Bank Integration Log\",\"col\":3}},{\"id\":\"TYhvjbcSb2\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Documentation\",\"col\":3}}]",
+ "content": "[{\"id\": \"bkf1\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Bank Feeds\", \"col\": 3}}, {\"id\": \"bkf1\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Airwallex Settings\", \"col\": 3}}, {\"id\": \"bkf1\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Skript Settings\", \"col\": 3}}, {\"id\": \"bkf1\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Bank Integration Log\", \"col\": 3}}]",
  "creation": "2025-10-08 03:54:31.165478",
  "custom_blocks": [],
  "docstatus": 0,
@@ -13,7 +13,7 @@
  "is_hidden": 0,
  "label": "Bank Integration",
  "links": [],
- "modified": "2025-10-08 11:22:11.816914",
+ "modified": "2026-11-17 13:00:00.000000",
  "modified_by": "Administrator",
  "module": "Bank Integration",
  "name": "Bank Integration",
@@ -27,25 +27,30 @@
  "shortcuts": [
   {
    "color": "Grey",
-   "doc_view": "New",
-   "label": "Bank Integration Setting",
-   "link_to": "Bank Integration Setting",
-   "stats_filter": "[]",
+   "doc_view": "",
+   "label": "Bank Feeds",
+   "link_to": "bank-feeds",
+   "type": "Page"
+  },
+  {
+   "color": "Grey",
+   "doc_view": "",
+   "label": "Airwallex Settings",
+   "link_to": "Airwallex Settings",
    "type": "DocType"
   },
   {
    "color": "Grey",
-   "doc_view": "List",
-   "label": "Documentation",
-   "type": "URL",
-   "url": "/docs"
+   "doc_view": "",
+   "label": "Skript Settings",
+   "link_to": "Skript Settings",
+   "type": "DocType"
   },
   {
    "color": "Grey",
    "doc_view": "List",
    "label": "Bank Integration Log",
    "link_to": "Bank Integration Log",
-   "stats_filter": "[]",
    "type": "DocType"
   }
  ],

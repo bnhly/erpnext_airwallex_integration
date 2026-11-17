@@ -67,81 +67,36 @@ class AirwallexAuthenticator(AirwallexBase):
             )
             return None
 
+    # The login token lives in the cache (Redis), keyed by client ID, never
+    # in a database field. Before 17 Nov 26 it sat in plain text on the
+    # Airwallex Client row (and the save committed mid-run).
+    def _cache_key(self):
+        return f"bank_integration:airwallex_token:{self.client_id}"
+
     def _get_cached_token_from_db(self):
-        """Get cached token from database if still valid"""
-        try:
-            # Get the Airwallex Client record for this client_id
-            client_doc = self._get_client_doc()
-            if not client_doc:
-                return None
-
-            # Check if token exists and is not expired
-            if client_doc.token and client_doc.token_expiry:
-                token_expiry = frappe.utils.get_datetime(client_doc.token_expiry)
-                current_time = frappe.utils.now_datetime()
-
-                # Add 5 minute buffer before expiry to avoid edge cases
-                buffer_time = timedelta(minutes=5)
-                if token_expiry > (current_time + buffer_time):
-                    return client_doc.token
-
+        """Cached token, if it has more than 5 minutes left."""
+        data = frappe.cache.get_value(self._cache_key(), expires=True) or {}
+        if not data.get("token") or not data.get("expiry"):
             return None
-
-        except Exception as e:
-            frappe.log_error(f"Failed to get cached token from database: {str(e)}", "Token DB Error")
-            return None
+        expiry = frappe.utils.get_datetime(data["expiry"])
+        if expiry > frappe.utils.now_datetime() + timedelta(minutes=5):
+            return data["token"]
+        return None
 
     def _cache_token_to_db(self, token_data):
-        """Cache the authentication token to database"""
-        try:
-            client_doc = self._get_client_doc()
-            if not client_doc:
-                frappe.log_error(f"Client document not found for client_id: {self.client_id}", "Token Cache Error")
-                return
-
-            expiry_time = _token_expiry(token_data)
-
-            # Update the client document
-            client_doc.token = token_data.get('token')
-            client_doc.token_expiry = expiry_time
-            client_doc.save(ignore_permissions=True)
-            frappe.db.commit()
-
-        except Exception as e:
-            frappe.log_error(f"Failed to cache token to database: {str(e)}", "Token Cache Error")
-
-    def _get_client_doc(self):
-        """Get the Airwallex Client document for this client_id"""
-        try:
-            # Get the Bank Integration Setting document
-            settings = frappe.get_single("Bank Integration Setting")
-
-            # Find the client with matching client_id
-            for client in settings.airwallex_clients:
-                if client.airwallex_client_id == self.client_id:
-                    return client
-
-            return None
-
-        except Exception as e:
-            frappe.log_error(f"Failed to get client document: {str(e)}", "Client Doc Error")
-            return None
+        expiry = _token_expiry(token_data)
+        secs = max(60, int((expiry - frappe.utils.now_datetime()).total_seconds()))
+        frappe.cache.set_value(
+            self._cache_key(),
+            {"token": token_data.get("token"), "expiry": str(expiry)},
+            expires_in_sec=secs,
+        )
 
     def _cache_token(self, token_data):
-        """Cache the authentication token (legacy method - now uses database)"""
         self._cache_token_to_db(token_data)
 
     def clear_cached_token(self):
-        """Clear cached token for this client from database"""
-        try:
-            client_doc = self._get_client_doc()
-            if client_doc:
-                client_doc.token = None
-                client_doc.token_expiry = None
-                client_doc.save(ignore_permissions=True)
-                frappe.db.commit()
-        except Exception as e:
-            frappe.log_error(f"Failed to clear cached token from database: {str(e)}", "Token Cache Error")
+        frappe.cache.delete_value(self._cache_key())
 
     def get_fresh_token(self):
         """Get a fresh token, bypassing cache"""

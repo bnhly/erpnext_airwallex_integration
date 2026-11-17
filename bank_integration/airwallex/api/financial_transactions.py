@@ -125,7 +125,7 @@ def test_get_transactions_with_dates():
     import pytz
 
     # Get settings to use the helper method
-    settings = frappe.get_single("Bank Integration Setting")
+    settings = frappe.get_single("Airwallex Settings")
 
     # Test with recent dates in local timezone
     local_tz = pytz.timezone(frappe.utils.get_system_timezone())
@@ -171,12 +171,12 @@ def test_token_refresh():
     from bank_integration.airwallex.api.airwallex_authenticator import AirwallexAuthenticator
 
     # Get first client settings
-    settings = frappe.get_single("Bank Integration Setting")
-    if not settings.airwallex_clients:
+    settings = frappe.get_single("Airwallex Settings")
+    if not settings.clients:
         print("No clients configured")
         return
 
-    client = settings.airwallex_clients[0]
+    client = settings.clients[0]
 
     # Test the token refresh mechanism
     auth = AirwallexAuthenticator(

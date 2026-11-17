@@ -149,23 +149,10 @@ app_license = "mit"
 # ---------------
 
 scheduler_events = {
-    "hourly_long": [
-        "bank_integration.airwallex.scheduler.run_hourly_sync",
-        "bank_integration.skript.skript_scheduler.run_hourly_skript_sync"
-    ],
-    "daily": [
-        "bank_integration.airwallex.scheduler.run_daily_sync",
-        "bank_integration.skript.skript_scheduler.run_daily_skript_sync"
-    ],
-    "weekly": [
-        "bank_integration.airwallex.scheduler.run_weekly_sync",
-        "bank_integration.skript.skript_scheduler.run_weekly_skript_sync"
-    ],
-    "monthly": [
-        "bank_integration.airwallex.scheduler.run_monthly_sync",
-        "bank_integration.skript.skript_scheduler.run_monthly_skript_sync"
-    ],
-
+    "hourly_long": ["bank_integration.feed.scheduler.hourly"],
+    "daily_long": ["bank_integration.feed.scheduler.daily"],
+    "weekly_long": ["bank_integration.feed.scheduler.weekly"],
+    "monthly_long": ["bank_integration.feed.scheduler.monthly"],
 }
 
 # Testing

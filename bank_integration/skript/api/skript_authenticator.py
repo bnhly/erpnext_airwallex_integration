@@ -21,8 +21,7 @@ class SkriptAuthenticator(SkriptBase):
                 return {"access_token": cached_token}
             
             # Get token URL from settings
-            settings = frappe.get_single("Bank Integration Setting")
-            token_url = settings.skript_access_token_url
+            token_url = frappe.db.get_single_value("Skript Settings", "token_url")
             
             if not token_url:
                 raise SkriptAPIError("Token URL not configured", 400)
@@ -89,8 +88,7 @@ class SkriptAuthenticator(SkriptBase):
     def _create_token_log(self, status, message, response=None, url=None, request_data=None):
         """Create log entry for token requests"""
         try:
-            settings = frappe.get_single("Bank Integration Setting")
-            if not settings.enable_log:
+            if not frappe.db.get_single_value("Skript Settings", "enable_log"):
                 return
             
             import json
@@ -121,6 +119,7 @@ class SkriptAuthenticator(SkriptBase):
             
             log = frappe.get_doc({
                 "doctype": "Bank Integration Log",
+                "provider": "Skript",
                 "status": status_string,
                 "message": f"Skript OAuth Token: {message}",
                 "response_data": response_str,
@@ -134,53 +133,34 @@ class SkriptAuthenticator(SkriptBase):
         except Exception as e:
             frappe.log_error(f"Token log creation error: {str(e)}", "Skript Token Log Error")
     
+    # The access token lives in the cache (Redis), never in a database
+    # field. Before 17 Nov 26 it sat in plain text on the settings record.
+    CACHE_KEY = "bank_integration:skript_token"
+
     def _get_cached_token_from_db(self):
-        """Get cached token from Bank Integration Setting"""
-        try:
-            settings = frappe.get_single("Bank Integration Setting")
-            
-            if settings.skript_access_token and settings.skript_token_expiry:
-                token_expiry = frappe.utils.get_datetime(settings.skript_token_expiry)
-                current_time = frappe.utils.now_datetime()
-                
-                # 5-minute buffer
-                buffer = timedelta(minutes=5)
-                if token_expiry > (current_time + buffer):
-                    return settings.skript_access_token
-            
+        data = frappe.cache.get_value(self.CACHE_KEY, expires=True) or {}
+        if not data.get("token") or not data.get("expiry"):
             return None
-        
-        except Exception as e:
-            frappe.log_error(f"Token cache retrieval error: {str(e)}", "Skript Token Cache")
-            return None
-    
+        expiry = frappe.utils.get_datetime(data["expiry"])
+        if expiry > frappe.utils.now_datetime() + timedelta(minutes=5):
+            return data["token"]
+        return None
+
     def _cache_token_to_db(self, token_data):
-        """Cache token to Bank Integration Setting"""
         try:
-            settings = frappe.get_single("Bank Integration Setting")
-            
-            # Calculate expiry
-            expires_in = token_data.get('expires_in', 3600)  # Default 1 hour
-            expiry_time = frappe.utils.now_datetime() + timedelta(seconds=expires_in)
-            
-            # Update settings
-            settings.db_set('skript_access_token', token_data.get('access_token'))
-            settings.db_set('skript_token_expiry', expiry_time)
-            frappe.db.commit()
-            
-        except Exception as e:
-            frappe.log_error(f"Token cache save error: {str(e)}", "Skript Token Cache")
-    
+            secs = int(token_data.get("expires_in") or 3600)
+        except (TypeError, ValueError):
+            secs = 3600
+        expiry = frappe.utils.now_datetime() + timedelta(seconds=secs)
+        frappe.cache.set_value(
+            self.CACHE_KEY,
+            {"token": token_data.get("access_token"), "expiry": str(expiry)},
+            expires_in_sec=max(60, secs),
+        )
+
     def clear_cached_token(self):
-        """Clear cached token"""
-        try:
-            settings = frappe.get_single("Bank Integration Setting")
-            settings.db_set('skript_access_token', None)
-            settings.db_set('skript_token_expiry', None)
-            frappe.db.commit()
-        except Exception as e:
-            frappe.log_error(f"Token clear error: {str(e)}", "Skript Token")
-    
+        frappe.cache.delete_value(self.CACHE_KEY)
+
     def get_valid_token(self):
         """Get valid token (cached or new)"""
         auth_response = self.authenticate()

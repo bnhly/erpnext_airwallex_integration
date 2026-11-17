@@ -21,7 +21,15 @@ from datetime import timedelta
 import frappe
 from frappe.utils import get_datetime, now_datetime
 
-SETTINGS = "Bank Integration Setting"
+AIRWALLEX = "Airwallex Settings"
+SKRIPT = "Skript Settings"
+DOCTYPE = {"airwallex": AIRWALLEX, "skript": SKRIPT}
+
+# Every provider settings record carries these run fields.
+STATUS_F = "sync_status"
+STARTED_F = "sync_started_on"
+REPORT_F = "sync_report"
+CURSOR_F = "last_sync_date"
 
 LOOKBACK_DAYS = 14
 MAX_HOLD_DAYS = 45
@@ -36,7 +44,7 @@ class FeedBusy(Exception):
 
 # ---------------------------------------------------------------- lock
 
-def claim_lock(status_field, started_field, who):
+def claim_lock(dt, who):
     """Mark a feed In Progress, unless a live run already holds it.
 
     Reads the two Singles rows FOR UPDATE so two workers cannot both claim.
@@ -47,25 +55,25 @@ def claim_lock(status_field, started_field, who):
     rows = frappe.db.sql(
         """select field, value from `tabSingles`
            where doctype=%s and field in (%s, %s) for update""",
-        (SETTINGS, status_field, started_field),
+        (dt, STATUS_F, STARTED_F),
     )
     vals = {r[0]: r[1] for r in rows}
     note = ""
-    if vals.get(status_field) == "In Progress":
-        started = get_datetime(vals.get(started_field)) if vals.get(started_field) else None
+    if vals.get(STATUS_F) == "In Progress":
+        started = get_datetime(vals.get(STARTED_F)) if vals.get(STARTED_F) else None
         if started and now_datetime() - started < timedelta(hours=STALE_HOURS):
             raise FeedBusy(f"{who}: a run started at {started} is still going")
         note = (
             f"{who}: took over a run left In Progress since {started or 'an unknown time'}"
         )
-    set_single(status_field, "In Progress")
-    set_single(started_field, now_datetime())
+    set_single(dt, STATUS_F, "In Progress")
+    set_single(dt, STARTED_F, now_datetime())
     frappe.db.commit()
     return note
 
 
-def release_lock(status_field, status):
-    set_single(status_field, status)
+def release_lock(dt, status):
+    set_single(dt, STATUS_F, status)
     frappe.db.commit()
 
 
@@ -167,20 +175,24 @@ def clean_reason(e):
 
 # ---------------------------------------------------------------- report
 
-def save_report(field, report):
+def save_report(dt, report):
     """Keep the last run's report (JSON) on the settings record."""
     fails = report.get("failed") or []
     if len(fails) > MAX_REPORT_FAILURES:
         report["failed_more"] = len(fails) - MAX_REPORT_FAILURES
         report["failed"] = fails[:MAX_REPORT_FAILURES]
-    set_single(field, json.dumps(report, default=str, indent=1))
+    set_single(dt, REPORT_F, json.dumps(report, default=str, indent=1))
 
 
-def set_single(field, value):
+def set_single(dt, field, value):
     """Write one settings value without touching modified (a form open on
     the page would otherwise say the record changed under it)."""
-    frappe.db.set_single_value(SETTINGS, field, value, update_modified=False)
+    frappe.db.set_single_value(dt, field, value, update_modified=False)
 
 
-def has_field(fieldname):
-    return bool(frappe.get_meta(SETTINGS).get_field(fieldname))
+def report_of(dt):
+    raw = frappe.db.get_single_value(dt, REPORT_F)
+    try:
+        return json.loads(raw) if raw else None
+    except ValueError:
+        return None

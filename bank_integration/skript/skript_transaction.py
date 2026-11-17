@@ -14,10 +14,8 @@ from bank_integration.bank_integration.doctype.bank_integration_log import bank_
 from bank_integration.feed import common
 
 
-STATUS_F = "skript_sync_status"
-STARTED_F = "skript_sync_started_on"
-REPORT_F = "skript_sync_report"
-CURSOR_F = "skript_last_sync_date"
+DT = common.SKRIPT
+CURSOR_F = common.CURSOR_F
 PAGE_SIZE = 1000
 MAX_PAGES = 100
 
@@ -107,7 +105,7 @@ def run_window(settings, from_dt, to_dt, dry_run=False):
     }
     account_map = {}
     names = {}
-    for row in settings.skript_accounts or []:
+    for row in settings.accounts or []:
         names[row.account_id] = row.display_name or row.masked_number or row.account_id
         if row.bank_account:
             account_map[row.account_id] = row.bank_account
@@ -115,11 +113,11 @@ def run_window(settings, from_dt, to_dt, dry_run=False):
             report["problems"].append(f"Skript account {names[row.account_id]} has no Bank Account")
 
     api = SkriptTransactions(
-        consumer_id=settings.skript_consumer_id,
-        client_id=settings.get_password("skript_client_id"),
-        client_secret=settings.get_password("skript_client_secret"),
-        api_url=settings.skript_api_url,
-        api_scope=settings.skript_api_scope,
+        consumer_id=settings.consumer_id,
+        client_id=settings.get_password("client_id"),
+        client_secret=settings.get_password("client_secret"),
+        api_url=settings.api_url,
+        api_scope=settings.api_scope,
     )
     lines = fetch_window(api, from_dt, to_dt)
     have = common.existing_ids([t.get("id") for t in lines])
@@ -173,26 +171,25 @@ def _finish(report, run, started, status):
     report["started"] = str(started)
     report["ended"] = str(frappe.utils.now_datetime())
     report["status"] = status
-    if common.has_field(REPORT_F):
-        common.save_report(REPORT_F, report)
+    common.save_report(DT, report)
 
 
 def _claim(run):
     try:
-        note = common.claim_lock(STATUS_F, STARTED_F, "Skript")
+        note = common.claim_lock(DT, "Skript")
     except common.FeedBusy as e:
         frappe.logger("bank_integration").info(str(e))
         return False
     if note:
-        bi_log.create_log(note, status="Error")
+        bi_log.create_log(note, status="Error", provider="Skript")
     return True
 
 
 def sync_skript_transactions(setting_name=None, from_date=None, to_date=None, run="sync old", **kwargs):
     """A manual range (the Skript "Sync old" button, or catch-up). Takes the
     same lock as the scheduled run and never moves the scheduled start."""
-    settings = frappe.get_single(common.SETTINGS)
-    if not settings.enable_skript:
+    settings = frappe.get_single(DT)
+    if not settings.enabled:
         return None
     if not _claim(run):
         return {"busy": True}
@@ -208,19 +205,19 @@ def sync_skript_transactions(setting_name=None, from_date=None, to_date=None, ru
         frappe.db.rollback()
         frappe.log_error(frappe.get_traceback(), f"Skript {run} failed")
     finally:
-        common.release_lock(STATUS_F, status)
+        common.release_lock(DT, status)
     return report
 
 
-def sync_scheduled_transactions_skript(setting_name=None, schedule_type=None):
+def sync_scheduled_transactions_skript(setting_name=None, schedule_type=None, force=False):
     """The scheduled run: window from the last good run less the look-back.
 
     One window for every account. The old code moved one cursor to the
     latest posting time on ANY account, so an account that posts late (Judo)
     lost every line posted before CBA's latest; the look-back covers that.
     """
-    settings = frappe.get_single(common.SETTINGS)
-    if not settings.enable_skript or settings.skript_sync_schedule != schedule_type:
+    settings = frappe.get_single(DT)
+    if not settings.enabled or (not force and settings.sync_schedule != schedule_type):
         return
     if not _claim("scheduled run"):
         return
@@ -232,15 +229,15 @@ def sync_scheduled_transactions_skript(setting_name=None, schedule_type=None):
         report = run_window(settings, from_dt, started)
         status = "Completed with Errors" if report["failed"] else "Completed"
         cursor = common.next_cursor(started, report["failed"], settings.get(CURSOR_F))
-        common.set_single(CURSOR_F, cursor)
-        _finish(report, "scheduled", started, status)
+        common.set_single(DT, CURSOR_F, cursor)
+        _finish(report, "sync now" if force else "scheduled", started, status)
         if report["created"] or report["failed"]:
             _log_summary("scheduled run", report)
     except Exception:
         frappe.db.rollback()
         frappe.log_error(frappe.get_traceback(), "Skript scheduled sync failed")
     finally:
-        common.release_lock(STATUS_F, status)
+        common.release_lock(DT, status)
 
 
 def _log_summary(run, report):
@@ -249,6 +246,7 @@ def _log_summary(run, report):
         f"Skript {run}: {report['created']} added, {fails} failed, "
         f"window {report['window'][0]} to {report['window'][1]}",
         status="Error" if fails else "Info",
+        provider="Skript",
     )
 
 

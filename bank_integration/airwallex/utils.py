@@ -428,11 +428,11 @@ def test_airwallex_mapping():
 def _get_airwallex_client(client_index=0):
     """Resolve credentials for an Airwallex Client row. Used by the generic
     diagnostic helpers below. Role-gated by their callers, not here."""
-    settings = frappe.get_single("Bank Integration Setting")
-    if not settings.airwallex_clients:
-        frappe.throw("No Airwallex Clients configured on Bank Integration Setting.")
+    settings = frappe.get_single("Airwallex Settings")
+    if not settings.clients:
+        frappe.throw("No Airwallex Clients configured on Airwallex Settings.")
     try:
-        client = settings.airwallex_clients[int(client_index)]
+        client = settings.clients[int(client_index)]
     except (IndexError, ValueError):
         frappe.throw(f"client_index {client_index} out of range.")
     return client, settings.api_url

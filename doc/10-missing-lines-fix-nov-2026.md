@@ -83,3 +83,23 @@ Airwallex and Skript stubbed (50 checks: paging, routing, a failure mid-run,
 the window held and the line coming in next run, a late line, stale and live
 locks, manual ranges, logging and masking, the purge, catch-up, Skript late
 posting and unmapped accounts).
+
+## Second release: each provider on its own (17 Nov 2026)
+
+- **Airwallex Settings** and **Skript Settings** replace Bank Integration
+  Setting. The patch `split_provider_settings` copies every value, moves the
+  client and account rows across in place (same row names, same encrypted
+  keys), moves the Skript client ID and secret, and removes the old record.
+  Running it twice changes nothing.
+- **Bank Feeds** page (`/app/bank-feeds`, Accounts Manager and System
+  Manager): each provider's status, last good run, last run and problems,
+  with Test connection, Sync now and Catch up; each Bank Account's last line,
+  lines in 30 days, weekdays with no line, drafts and last run failures.
+  Catch up on the page does the same as step 5 and 6 above: Check first,
+  then Add.
+- One schedule entry per frequency runs both providers; each runs only when
+  its own Sync Every matches. Every log row says which provider made it.
+- Login tokens live in the cache, not in a field. The patch clears the
+  tokens left in the old fields.
+- After deploy: open Airwallex Settings and Skript Settings once and check
+  the values look right before the next hourly run.

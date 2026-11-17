@@ -94,10 +94,10 @@ def backfill_reference_numbers(
             frappe.PermissionError,
         )
 
-    settings = frappe.get_single("Bank Integration Setting")
-    if not settings.airwallex_clients:
+    settings = frappe.get_single("Airwallex Settings")
+    if not settings.clients:
         return {"error": "no Airwallex clients configured"}
-    client = settings.airwallex_clients[int(client_index)]
+    client = settings.clients[int(client_index)]
     api_url = settings.api_url
     from_iso, to_iso = _iso_range(from_date, to_date)
     dry_run = bool(int(dry_run))
@@ -228,11 +228,11 @@ def link_existing_purchase_invoices(
     dry_run = bool(int(dry_run))
     force_relink = bool(int(force_relink))
 
-    settings = frappe.get_single("Bank Integration Setting")
-    if not settings.airwallex_clients:
+    settings = frappe.get_single("Airwallex Settings")
+    if not settings.clients:
         return {"error": "no Airwallex clients configured"}
 
-    client = settings.airwallex_clients[int(client_index)]
+    client = settings.clients[int(client_index)]
     api_url = settings.api_url
     from_iso, to_iso = _expense_iso_range(settings, from_date, to_date)
 

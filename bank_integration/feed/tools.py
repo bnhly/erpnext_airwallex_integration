@@ -37,32 +37,21 @@ def _allowed():
         frappe.throw("Only a System Manager or Accounts Manager can run this.", frappe.PermissionError)
 
 
-def _json(field):
-    import json
-
-    raw = frappe.db.get_single_value(common.SETTINGS, field) if common.has_field(field) else None
-    try:
-        return json.loads(raw) if raw else None
-    except ValueError:
-        return raw
-
-
 @frappe.whitelist()
 def feed_check(txn=None, ask_airwallex=0, errors_since="2026-10-25"):
     _allowed()
     from bank_integration.airwallex.transaction import client_routes
 
-    s = frappe.get_single(common.SETTINGS)
+    s = frappe.get_single(common.AIRWALLEX)
+    k = frappe.get_single(common.SKRIPT)
     out = {"settings": {}, "airwallex_rows": [], "airwallex_problems": []}
-    for f in (
-        "enable_airwallex", "sync_schedule", "sync_status", "sync_started_on", "last_sync_date",
-        "sync_old_transactions", "from_date", "to_date", "enable_log",
-        "enable_skript", "skript_sync_schedule", "skript_sync_status", "skript_sync_started_on",
-        "skript_last_sync_date", "skript_sync_old_transactions",
-    ):
-        out["settings"][f] = str(s.get(f)) if s.get(f) is not None else None
+    for label, doc in (("airwallex", s), ("skript", k)):
+        out["settings"][label] = {
+            f: (str(doc.get(f)) if doc.get(f) is not None else None)
+            for f in ("enabled", "sync_schedule", "sync_status", "sync_started_on", "last_sync_date", "enable_log")
+        }
 
-    for row in s.airwallex_clients or []:
+    for row in s.clients or []:
         acc = frappe.db.get_value("Bank Account", row.bank_account, "account") if row.bank_account else None
         out["airwallex_rows"].append({
             "row": row.idx,
@@ -79,7 +68,7 @@ def feed_check(txn=None, ask_airwallex=0, errors_since="2026-10-25"):
     ]
     out["skript_accounts"] = [
         {"account": r.display_name or r.masked_number or r.account_id, "bank_account": r.bank_account}
-        for r in s.skript_accounts or []
+        for r in k.accounts or []
     ]
 
     # Was Bank Account made mandatory on Bank Transaction, and when?
@@ -90,8 +79,8 @@ def feed_check(txn=None, ask_airwallex=0, errors_since="2026-10-25"):
         as_dict=True,
     )
 
-    feed_accounts = sorted({r.bank_account for r in s.airwallex_clients or [] if r.bank_account}
-                           | {r.bank_account for r in s.skript_accounts or [] if r.bank_account})
+    feed_accounts = sorted({r.bank_account for r in s.clients or [] if r.bank_account}
+                           | {r.bank_account for r in k.accounts or [] if r.bank_account})
     out["lines_by_bank_account"] = frappe.db.sql(
         """select bank_account, docstatus, count(*) n_lines, max(date) last_date,
                   max(creation) last_made
@@ -127,8 +116,8 @@ def feed_check(txn=None, ask_airwallex=0, errors_since="2026-10-25"):
         as_dict=True,
     )
     out["bank_integration_log_rows"] = frappe.db.count("Bank Integration Log")
-    out["last_airwallex_report"] = _json("sync_report")
-    out["last_skript_report"] = _json("skript_sync_report")
+    out["last_airwallex_report"] = common.report_of(common.AIRWALLEX)
+    out["last_skript_report"] = common.report_of(common.SKRIPT)
 
     if txn:
         out["txn"] = {
@@ -185,7 +174,7 @@ def catch_up(provider, from_date, to_date=None, dry_run=1, confirm=None, currenc
     curs = [c.strip().upper() for c in str(currencies or "").split(",") if c.strip()]
 
     if str(dry_run) != "0":
-        settings = frappe.get_single(common.SETTINGS)
+        settings = frappe.get_single(common.DOCTYPE[provider])
         total = {"provider": provider, "dry_run": True, "would_add": [], "failed": [],
                  "problems": [], "unrouted": {}, "slices": 0}
         for a, b in _slices(from_dt, to_dt):
@@ -237,18 +226,17 @@ def _run(provider, settings, a, b, dry, curs):
 def catch_up_job(provider, from_date, to_date, currencies="", by=None):
     """Background catch-up: the range in month slices, under the feed's lock."""
     curs = [c for c in currencies.split(",") if c]
-    status_f = "sync_status" if provider == "airwallex" else "skript_sync_status"
-    started_f = "sync_started_on" if provider == "airwallex" else "skript_sync_started_on"
+    dt = common.DOCTYPE[provider]
     from bank_integration.bank_integration.doctype.bank_integration_log import bank_integration_log as bi_log
 
     try:
-        note = common.claim_lock(status_f, started_f, provider.title())
+        note = common.claim_lock(dt, provider.title())
     except common.FeedBusy as e:
-        bi_log.create_log(f"Catch-up not started: {e}", status="Error")
+        bi_log.create_log(f"Catch-up not started: {e}", status="Error", provider=provider.title())
         return
     if note:
-        bi_log.create_log(note, status="Error")
-    settings = frappe.get_single(common.SETTINGS)
+        bi_log.create_log(note, status="Error", provider=provider.title())
+    settings = frappe.get_single(dt)
     added, failed, status = 0, [], "Failed"
     try:
         for a, b in _slices(get_datetime(from_date), get_datetime(to_date)):
@@ -259,13 +247,14 @@ def catch_up_job(provider, from_date, to_date, currencies="", by=None):
         status = "Completed with Errors" if failed else "Completed"
         report = {"run": "catch-up", "window": [from_date, to_date], "created": added,
                   "failed": failed, "status": status, "by": by}
-        common.save_report("sync_report" if provider == "airwallex" else "skript_sync_report", report)
+        common.save_report(dt, report)
         bi_log.create_log(
             f"{provider.title()} catch-up {from_date} to {to_date}: {added} added, {len(failed)} failed",
             status="Error" if failed else "Info",
+            provider=provider.title(),
         )
     except Exception:
         frappe.db.rollback()
         frappe.log_error(frappe.get_traceback(), f"{provider.title()} catch-up failed")
     finally:
-        common.release_lock(status_f, status)
+        common.release_lock(dt, status)

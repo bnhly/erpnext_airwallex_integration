@@ -34,10 +34,8 @@ from bank_integration.airwallex.utils import build_expense_merchant_index, map_a
 from bank_integration.bank_integration.doctype.bank_integration_log import bank_integration_log as bi_log
 from bank_integration.feed import common
 
-STATUS_F = "sync_status"
-STARTED_F = "sync_started_on"
-REPORT_F = "sync_report"
-CURSOR_F = "last_sync_date"
+DT = common.AIRWALLEX
+CURSOR_F = common.CURSOR_F
 
 CARD_TYPES = ("CARD_PURCHASE", "CARD_REFUND")
 
@@ -52,7 +50,7 @@ def client_routes(settings):
     """
     logins = {}
     problems = []
-    for row in settings.airwallex_clients or []:
+    for row in settings.clients or []:
         cid = (row.airwallex_client_id or "").strip()
         if not cid:
             problems.append(f"Row {row.idx}: no client ID")
@@ -222,8 +220,7 @@ def _finish(report, run, started, status):
     report["started"] = str(started)
     report["ended"] = str(now_datetime())
     report["status"] = status
-    if common.has_field(REPORT_F):
-        common.save_report(REPORT_F, report)
+    common.save_report(DT, report)
 
 
 def _status_of(report):
@@ -236,23 +233,26 @@ def _log_summary(run, report):
         f"Airwallex {run}: {report['created']} added, {fails} failed, "
         f"window {report['window'][0]} to {report['window'][1]}"
     )
-    bi_log.create_log(words, status="Error" if fails else "Info")
+    bi_log.create_log(provider="Airwallex", message=words, status="Error" if fails else "Info")
 
 
 # ------------------------------------------------------------------ scheduled
 
-def sync_scheduled_transactions(setting_name=None, schedule_type=None):
-    """The scheduled run: window from the last good run less the look-back."""
-    settings = frappe.get_single(common.SETTINGS)
+def sync_scheduled_transactions(setting_name=None, schedule_type=None, force=False):
+    """The scheduled run: window from the last good run less the look-back.
+    force: run now whatever the schedule (Sync now on the Bank Feeds page)."""
+    settings = frappe.get_single(DT)
     if not settings.is_enabled():
         return
+    if not force and settings.sync_schedule != schedule_type:
+        return
     try:
-        note = common.claim_lock(STATUS_F, STARTED_F, "Airwallex")
+        note = common.claim_lock(DT, "Airwallex")
     except common.FeedBusy as e:
         frappe.logger("bank_integration").info(str(e))
         return
     if note:
-        bi_log.create_log(note, status="Error")
+        bi_log.create_log(provider="Airwallex", message=note, status="Error")
 
     started = now_datetime()
     status = "Failed"
@@ -262,8 +262,8 @@ def sync_scheduled_transactions(setting_name=None, schedule_type=None):
         report = run_window(settings, from_dt, started)
         status = _status_of(report)
         cursor = common.next_cursor(started, report["failed"], settings.get(CURSOR_F))
-        common.set_single(CURSOR_F, cursor)
-        _finish(report, "scheduled", started, status)
+        common.set_single(DT, CURSOR_F, cursor)
+        _finish(report, "sync now" if force else "scheduled", started, status)
         _backfill_after(started)
         if report["created"] or report["failed"]:
             _log_summary("scheduled run", report)
@@ -272,7 +272,7 @@ def sync_scheduled_transactions(setting_name=None, schedule_type=None):
         frappe.log_error(frappe.get_traceback(), "Airwallex scheduled sync failed")
         status = "Failed"
     finally:
-        common.release_lock(STATUS_F, status)
+        common.release_lock(DT, status)
 
 
 # ------------------------------------------------------------------ manual / catch-up
@@ -283,14 +283,14 @@ def sync_transactions(from_date, to_date, setting_name=None, run="sync old", **k
     Takes the same lock as the scheduled run. Never moves the scheduled
     start point.
     """
-    settings = frappe.get_single(common.SETTINGS)
+    settings = frappe.get_single(DT)
     try:
-        note = common.claim_lock(STATUS_F, STARTED_F, "Airwallex")
+        note = common.claim_lock(DT, "Airwallex")
     except common.FeedBusy as e:
-        bi_log.create_log(f"{run} not started: {e}", status="Error")
+        bi_log.create_log(provider="Airwallex", message=f"{run} not started: {e}", status="Error")
         return {"busy": str(e)}
     if note:
-        bi_log.create_log(note, status="Error")
+        bi_log.create_log(provider="Airwallex", message=note, status="Error")
 
     started = now_datetime()
     status = "Failed"
@@ -305,7 +305,7 @@ def sync_transactions(from_date, to_date, setting_name=None, run="sync old", **k
         frappe.db.rollback()
         frappe.log_error(frappe.get_traceback(), f"Airwallex {run} failed")
     finally:
-        common.release_lock(STATUS_F, status)
+        common.release_lock(DT, status)
     return report
 
 

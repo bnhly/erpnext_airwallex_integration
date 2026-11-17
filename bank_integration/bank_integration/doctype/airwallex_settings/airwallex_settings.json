@@ -1,0 +1,141 @@
+{
+ "actions": [],
+ "creation": "2026-11-17 13:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "issingle": 1,
+ "field_order": [
+  "enabled",
+  "connection_section",
+  "api_url",
+  "connection_column",
+  "sync_schedule",
+  "enable_log",
+  "clients_section",
+  "clients",
+  "filters_section",
+  "transaction_type_filters",
+  "run_section",
+  "sync_status",
+  "sync_started_on",
+  "run_column",
+  "last_sync_date",
+  "sync_report"
+ ],
+ "fields": [
+  {
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Enabled"
+  },
+  {
+   "fieldname": "connection_section",
+   "fieldtype": "Section Break",
+   "label": "Connection"
+  },
+  {
+   "fieldname": "api_url",
+   "fieldtype": "Data",
+   "label": "API URL",
+   "default": "https://api.airwallex.com/api/v1"
+  },
+  {
+   "fieldname": "connection_column",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "sync_schedule",
+   "fieldtype": "Select",
+   "label": "Sync Every",
+   "options": "Hourly\nDaily\nWeekly\nMonthly",
+   "default": "Hourly"
+  },
+  {
+   "fieldname": "enable_log",
+   "fieldtype": "Check",
+   "label": "Log Every Call"
+  },
+  {
+   "fieldname": "clients_section",
+   "fieldtype": "Section Break",
+   "label": "Logins and bank accounts"
+  },
+  {
+   "fieldname": "clients",
+   "fieldtype": "Table",
+   "label": "Logins",
+   "options": "Airwallex Client"
+  },
+  {
+   "fieldname": "filters_section",
+   "fieldtype": "Section Break",
+   "label": "Transaction types",
+   "collapsible": 1
+  },
+  {
+   "fieldname": "transaction_type_filters",
+   "fieldtype": "Table",
+   "label": "Transaction Type Filters",
+   "options": "Transaction Type Filter"
+  },
+  {
+   "fieldname": "run_section",
+   "fieldtype": "Section Break",
+   "label": "Last run",
+   "collapsible": 1
+  },
+  {
+   "fieldname": "sync_status",
+   "fieldtype": "Select",
+   "label": "Status",
+   "options": "Not Started\nIn Progress\nCompleted\nCompleted with Errors\nFailed",
+   "default": "Not Started",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sync_started_on",
+   "fieldtype": "Datetime",
+   "label": "Run Started",
+   "read_only": 1
+  },
+  {
+   "fieldname": "run_column",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "last_sync_date",
+   "fieldtype": "Datetime",
+   "label": "Last Good Run",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sync_report",
+   "fieldtype": "Long Text",
+   "label": "Last Run Report",
+   "read_only": 1,
+   "hidden": 1
+  }
+ ],
+ "links": [],
+ "modified": "2026-11-17 13:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Bank Integration",
+ "name": "Airwallex Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

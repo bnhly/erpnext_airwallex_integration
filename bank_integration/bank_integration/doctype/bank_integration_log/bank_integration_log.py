@@ -15,6 +15,7 @@ class BankIntegrationLog(Document):
 		from frappe.types import DF
 
 		message: DF.LongText | None
+		provider: DF.Literal["", "Airwallex", "Skript"]
 		method: DF.SmallText | None
 		request_data: DF.Code | None
 		request_headers: DF.Code | None
@@ -55,12 +56,12 @@ class BankIntegrationLog(Document):
 				pass
 
 
-def create_log(message, status="Info", response=None, method=None, payload=None, url=None, status_code=None):
-	"""Create log entry for connection test"""
+def create_log(message, status="Info", response=None, method=None, payload=None, url=None, status_code=None, provider=None):
+	"""A summary or problem row (not an HTTP call)."""
 	try:
-		status_string = "Success" if str(status).startswith("2") else "Error"
 		log = frappe.get_doc({
 			"doctype": "Bank Integration Log",
+			"provider": provider,
 			"status": status,
 			"message": message,
 			"response_data": response,

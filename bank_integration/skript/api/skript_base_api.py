@@ -11,9 +11,9 @@ class SkriptBase:
         self.client_id = client_id
         self.client_secret = client_secret
         self.api_url = api_url
-        # Follow the Enable Log tick on Bank Integration Setting (was always on).
+        # Follow the Log Every Call tick on Skript Settings (was always on).
         # Errors are still logged when it is off.
-        self.enable_api_log = bool(frappe.db.get_single_value("Bank Integration Setting", "enable_log"))
+        self.enable_api_log = bool(frappe.db.get_single_value("Skript Settings", "enable_log"))
         self.skript_api_scope = api_scope
         
         # Standard headers
@@ -147,6 +147,7 @@ class SkriptBase:
             
             log = frappe.get_doc({
                 "doctype": "Bank Integration Log",
+                "provider": "Skript",
                 "status": status_string,
                 "message": str(message),
                 "response_data": str(response) if response else "",

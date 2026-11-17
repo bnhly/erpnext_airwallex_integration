@@ -168,36 +168,38 @@ def reset_state(accts, with_skript=False):
     frappe.db.sql("delete from `tabBank Transaction` where transaction_id like 'ft-%%'")
     frappe.db.sql("delete from `tabProperty Setter` where doc_type='Bank Transaction' and field_name='reference_number'")
     frappe.clear_cache(doctype="Bank Transaction")
-    s = frappe.get_single("Bank Integration Setting")
-    s.flags.ignore_validate = True
-    s.enable_airwallex = 1
+    s = frappe.get_single("Airwallex Settings")
+    s.enabled = 1
     s.api_url = "https://api.airwallex.test/api/v1"
     s.sync_schedule = "Hourly"
     s.enable_log = 0
-    s.sync_old_transactions = 0
-    s.set("airwallex_clients", [])
+    s.set("clients", [])
     # USD row first on purpose: the order must not matter any more.
-    s.append("airwallex_clients", {"bank_account": accts["FT AWX USD"], "airwallex_client_id": "CLIENT-ONE-LOGIN",
+    s.append("clients", {"bank_account": accts["FT AWX USD"], "airwallex_client_id": "CLIENT-ONE-LOGIN",
                                    "airwallex_api_key": "LONGLIFE-API-KEY-XYZ"})
-    s.append("airwallex_clients", {"bank_account": accts["FT AWX AUD"], "airwallex_client_id": "CLIENT-ONE-LOGIN",
+    s.append("clients", {"bank_account": accts["FT AWX AUD"], "airwallex_client_id": "CLIENT-ONE-LOGIN",
                                    "airwallex_api_key": "LONGLIFE-API-KEY-XYZ"})
     s.set("transaction_type_filters", [])
-    s.enable_skript = 1 if with_skript else 0
-    s.skript_api_url = "https://skript.test/v1"
-    s.skript_access_token_url = "https://skript.test/token"
-    s.skript_consumer_id = "CONSUMER"
-    s.skript_client_id = "SK-ID"
-    s.skript_client_secret = "SK-SECRET"
-    s.skript_sync_schedule = "Hourly"
-    s.set("skript_accounts", [])
-    s.append("skript_accounts", {"account_id": "acc-cba", "display_name": "CBA Transaction", "bank_account": accts["FT CBA"]})
-    s.append("skript_accounts", {"account_id": "acc-judo", "display_name": "Judo LOC 5803", "bank_account": accts["FT Judo"]})
-    s.append("skript_accounts", {"account_id": "acc-new", "display_name": "New account", "bank_account": None})
     s.save(ignore_permissions=True)
-    for f, v in (("sync_status", "Completed"), ("sync_started_on", None), ("last_sync_date", None),
-                 ("sync_report", None), ("skript_sync_status", "Completed"), ("skript_sync_started_on", None),
-                 ("skript_last_sync_date", None), ("skript_sync_report", None)):
-        frappe.db.set_single_value("Bank Integration Setting", f, v, update_modified=False)
+    k = frappe.get_single("Skript Settings")
+    k.enabled = 1 if with_skript else 0
+    k.api_url = "https://skript.test/v1"
+    k.token_url = "https://skript.test/token"
+    k.consumer_id = "CONSUMER"
+    k.client_id = "SK-ID"
+    k.client_secret = "SK-SECRET"
+    k.sync_schedule = "Hourly"
+    k.set("accounts", [])
+    k.append("accounts", {"account_id": "acc-cba", "display_name": "CBA Transaction", "bank_account": accts["FT CBA"]})
+    k.append("accounts", {"account_id": "acc-judo", "display_name": "Judo LOC 5803", "bank_account": accts["FT Judo"]})
+    k.append("accounts", {"account_id": "acc-new", "display_name": "New account", "bank_account": None})
+    k.save(ignore_permissions=True)
+    for dt in ("Airwallex Settings", "Skript Settings"):
+        for f, v in (("sync_status", "Completed"), ("sync_started_on", None), ("last_sync_date", None),
+                     ("sync_report", None)):
+            frappe.db.set_single_value(dt, f, v, update_modified=False)
+    frappe.cache.delete_value("bank_integration:airwallex_token:CLIENT-ONE-LOGIN")
+    frappe.cache.delete_value("bank_integration:skript_token")
     frappe.db.commit()
 
 
@@ -256,7 +258,7 @@ def run():
     awx.lines = [line(i, now - timedelta(hours=1, minutes=i)) for i in range(1, 21)]
     awx.lines += [line(100 + i, now - timedelta(hours=2, minutes=i), cur="USD") for i in range(1, 4)]
     awx.lines += [line(200 + i, now - timedelta(hours=2, minutes=i), cur="GBP") for i in range(1, 3)]
-    sync_scheduled_transactions("Bank Integration Setting", "Hourly")
+    sync_scheduled_transactions(None, "Hourly")
     aud = [bt(f"ft-{i}") for i in range(1, 21)]
     usd = [bt(f"ft-{100 + i}") for i in range(1, 4)]
     check("A1 all 20 AUD lines in, across three pages", all(aud), [i for i, x in enumerate(aud, 1) if not x])
@@ -264,15 +266,15 @@ def run():
     check("A1 USD lines on the USD bank account", all(x and x.bank_account == accts["FT AWX USD"] for x in usd))
     check("A1 GBP (no row) not inserted", not bt("ft-201"))
     check("A1 submitted", all(x and x.docstatus == 1 for x in aud + usd))
-    rep = json.loads(frappe.db.get_single_value("Bank Integration Setting", "sync_report"))
+    rep = json.loads(frappe.db.get_single_value("Airwallex Settings", "sync_report"))
     check("A1 report Completed, GBP counted as unrouted",
           rep["status"] == "Completed" and rep["logins"][0]["unrouted"].get("GBP") == 2, rep)
     logins = [c for c in awx.calls if c[1].endswith("authentication/login")]
     first = [c[2].get("page_num") for c in awx.calls if c[1].endswith("/financial_transactions")][:5]
     check("A1 one login, each page read once (not once per client row)",
           len(logins) == 1 and first[:4] == [0, 1, 2, 3], (len(logins), first))
-    check("A1 status released", frappe.db.get_single_value("Bank Integration Setting", "sync_status") == "Completed")
-    cursor1 = frappe.db.get_single_value("Bank Integration Setting", "last_sync_date")
+    check("A1 status released", frappe.db.get_single_value("Airwallex Settings", "sync_status") == "Completed")
+    cursor1 = frappe.db.get_single_value("Airwallex Settings", "last_sync_date")
     check("A1 next window point moved to the run start", cursor1 and abs((frappe.utils.get_datetime(cursor1) - now).total_seconds()) < 120, cursor1)
 
     # ---- A2 local date (Melbourne): a line made at 08:00 local is that day, not the day before
@@ -290,16 +292,16 @@ def run():
     awx.lines.append(line(300, now - timedelta(minutes=30), batch="has-ref"))
     awx.lines.append(line(301, t_fail, batch=""))            # no reference -> refused
     awx.lines.append(line(302, now - timedelta(minutes=10), batch="has-ref"))
-    sync_scheduled_transactions("Bank Integration Setting", "Hourly")
+    sync_scheduled_transactions(None, "Hourly")
     check("A3 good lines either side of a bad one went in", bt("ft-300") and bt("ft-302"))
     check("A3 the bad line left nothing behind", not bt("ft-301"))
-    rep = json.loads(frappe.db.get_single_value("Bank Integration Setting", "sync_report"))
+    rep = json.loads(frappe.db.get_single_value("Airwallex Settings", "sync_report"))
     check("A3 run says Completed with Errors and names the line",
           rep["status"] == "Completed with Errors" and rep["failed"][0]["id"] == "ft-301", rep.get("failed"))
     check("A3 reason is the real one", "Reference Number" in (rep["failed"][0].get("reason") or ""), rep["failed"][0])
     check("A3 settings status Completed with Errors",
-          frappe.db.get_single_value("Bank Integration Setting", "sync_status") == "Completed with Errors")
-    cursor2 = frappe.utils.get_datetime(frappe.db.get_single_value("Bank Integration Setting", "last_sync_date"))
+          frappe.db.get_single_value("Airwallex Settings", "sync_status") == "Completed with Errors")
+    cursor2 = frappe.utils.get_datetime(frappe.db.get_single_value("Airwallex Settings", "last_sync_date"))
     check("A3 window held at or before the failed line", cursor2 <= t_fail + timedelta(seconds=1), (cursor2, t_fail))
     check("A3 no Error Log row per line", not frappe.db.exists("Error Log", {"method": ["like", "Txn Error%"], "creation": [">", now]}))
 
@@ -308,50 +310,50 @@ def run():
         frappe.delete_doc("Property Setter", ps, ignore_permissions=True)
     frappe.clear_cache(doctype="Bank Transaction")
     frappe.db.commit()
-    sync_scheduled_transactions("Bank Integration Setting", "Hourly")
-    rep = json.loads(frappe.db.get_single_value("Bank Integration Setting", "sync_report"))
+    sync_scheduled_transactions(None, "Hourly")
+    rep = json.loads(frappe.db.get_single_value("Airwallex Settings", "sync_report"))
     check("A4 failed line comes in on the next run", bool(bt("ft-301")), rep.get("failed"))
     check("A4 no duplicates (existing skipped)", rep["created"] == 1, rep["created"])
 
     # ---- A5 late line inside the look-back window
     awx.lines.append(line(400, now - timedelta(days=5)))
-    sync_scheduled_transactions("Bank Integration Setting", "Hourly")
+    sync_scheduled_transactions(None, "Hourly")
     check("A5 a line Airwallex lists late (5 days back) is picked up", bool(bt("ft-400")))
 
     # ---- A6 stale lock taken over, live lock respected
-    frappe.db.set_single_value("Bank Integration Setting", "sync_status", "In Progress", update_modified=False)
-    frappe.db.set_single_value("Bank Integration Setting", "sync_started_on", now - timedelta(minutes=10), update_modified=False)
+    frappe.db.set_single_value("Airwallex Settings", "sync_status", "In Progress", update_modified=False)
+    frappe.db.set_single_value("Airwallex Settings", "sync_started_on", now - timedelta(minutes=10), update_modified=False)
     frappe.db.commit()
     awx.lines.append(line(500, now - timedelta(minutes=5)))
-    sync_scheduled_transactions("Bank Integration Setting", "Hourly")
+    sync_scheduled_transactions(None, "Hourly")
     check("A6 a live run (10 min old) is left alone", not bt("ft-500"))
-    frappe.db.set_single_value("Bank Integration Setting", "sync_started_on", now - timedelta(hours=5), update_modified=False)
+    frappe.db.set_single_value("Airwallex Settings", "sync_started_on", now - timedelta(hours=5), update_modified=False)
     frappe.db.commit()
-    sync_scheduled_transactions("Bank Integration Setting", "Hourly")
+    sync_scheduled_transactions(None, "Hourly")
     check("A6 a dead run (5 h old) is taken over", bool(bt("ft-500")))
-    check("A6 lock released", frappe.db.get_single_value("Bank Integration Setting", "sync_status") != "In Progress")
-    frappe.db.set_single_value("Bank Integration Setting", "sync_status", "In Progress", update_modified=False)
-    frappe.db.set_single_value("Bank Integration Setting", "sync_started_on", None, update_modified=False)
+    check("A6 lock released", frappe.db.get_single_value("Airwallex Settings", "sync_status") != "In Progress")
+    frappe.db.set_single_value("Airwallex Settings", "sync_status", "In Progress", update_modified=False)
+    frappe.db.set_single_value("Airwallex Settings", "sync_started_on", None, update_modified=False)
     frappe.db.commit()
-    from bank_integration.airwallex import scheduler
+    from bank_integration.feed import scheduler
 
     awx.lines.append(line(501, now - timedelta(minutes=4)))
-    scheduler.run_hourly_sync()
+    scheduler.hourly()
     check("A6 scheduler entry point no longer blocked by a dead In Progress", bool(bt("ft-501")))
 
     # ---- A7 manual range does not move the scheduled start point
-    before = frappe.db.get_single_value("Bank Integration Setting", "last_sync_date")
+    before = frappe.db.get_single_value("Airwallex Settings", "last_sync_date")
     awx.lines.append(line(600, now - timedelta(days=40)))
-    sync_transactions(str(now - timedelta(days=41)), str(now - timedelta(days=39)), "Bank Integration Setting")
+    sync_transactions(str(now - timedelta(days=41)), str(now - timedelta(days=39)))
     check("A7 manual range brings its line in", bool(bt("ft-600")))
     check("A7 manual range leaves the scheduled start point alone",
-          str(frappe.db.get_single_value("Bank Integration Setting", "last_sync_date")) == str(before))
+          str(frappe.db.get_single_value("Airwallex Settings", "last_sync_date")) == str(before))
 
     # ---- A8 cursor-style paging also read to the end
     awx.style = "cursor"
     awx.page_size_cap = 3
     awx.lines += [line(700 + i, now - timedelta(days=50, minutes=i)) for i in range(10)]
-    sync_transactions(str(now - timedelta(days=51)), str(now - timedelta(days=49)), "Bank Integration Setting")
+    sync_transactions(str(now - timedelta(days=51)), str(now - timedelta(days=49)))
     check("A8 page_after paging read to the end", all(bt(f"ft-{700 + i}") for i in range(10)))
     awx.style = "has_more"
     awx.page_size_cap = None
@@ -360,18 +362,18 @@ def run():
     from bank_integration.feed.maintenance import counts, delete_logs_before, purge_job
 
     awx.lines.append(line(800, now - timedelta(minutes=3)))
-    frappe.db.set_value("Airwallex Client", {"parent": "Bank Integration Setting"}, "token", None)
-    sync_scheduled_transactions("Bank Integration Setting", "Hourly")
+    frappe.cache.delete_value("bank_integration:airwallex_token:CLIENT-ONE-LOGIN")
+    sync_scheduled_transactions(None, "Hourly")
     new_rows = frappe.get_all("Bank Integration Log", filters={"creation": [">=", now]},
                               fields=["status", "url", "request_headers", "response_data", "message"])
     api_rows = [r for r in new_rows if r.url]
     check("L1 Enable Log off: no rows for successful calls", not [r for r in api_rows if r.status == "Success"],
           [r.url for r in api_rows if r.status == "Success"][:3])
-    frappe.db.set_single_value("Bank Integration Setting", "enable_log", 1, update_modified=False)
-    frappe.db.set_value("Airwallex Client", {"parent": "Bank Integration Setting"}, "token", None)
+    frappe.db.set_single_value("Airwallex Settings", "enable_log", 1, update_modified=False)
+    frappe.cache.delete_value("bank_integration:airwallex_token:CLIENT-ONE-LOGIN")
     frappe.db.commit()
     awx.lines.append(line(801, now - timedelta(minutes=2)))
-    sync_scheduled_transactions("Bank Integration Setting", "Hourly")
+    sync_scheduled_transactions(None, "Hourly")
     rows = frappe.get_all("Bank Integration Log", filters={"creation": [">=", now]},
                           fields=["status", "url", "request_headers", "response_data", "message"])
     blob = json.dumps(rows)
@@ -379,12 +381,15 @@ def run():
     check("L3 no API key in any row", "LONGLIFE-API-KEY-XYZ" not in blob)
     check("L4 no bearer token in any row", "TOKEN-SECRET-123" not in blob)
     check("L5 the 404 lookups are still logged as errors", any(r.status == "Error" for r in rows))
-    frappe.db.set_single_value("Bank Integration Setting", "enable_log", 0, update_modified=False)
+    frappe.db.set_single_value("Airwallex Settings", "enable_log", 0, update_modified=False)
 
     # ---- T token expiry read from expires_at
-    tok_exp = frappe.db.get_value("Airwallex Client", {"parent": "Bank Integration Setting", "idx": 1}, "token_expiry") \
-        or frappe.db.get_value("Airwallex Client", {"parent": "Bank Integration Setting", "idx": 2}, "token_expiry")
-    check("T1 token expiry taken from expires_at", str(tok_exp).startswith("2099") or str(tok_exp).startswith("2098"), tok_exp)
+    cached = frappe.cache.get_value("bank_integration:airwallex_token:CLIENT-ONE-LOGIN") or {}
+    check("T1 token kept in the cache, expiry taken from expires_at",
+          cached.get("token") == "TOKEN-SECRET-123" and str(cached.get("expiry", "")).startswith(("2098", "2099")), cached)
+    check("T2 no token in any database field",
+          "TOKEN-SECRET-123" not in json.dumps(frappe.db.sql("select * from `tabAirwallex Client`"), default=str)
+          and "TOKEN-SECRET-123" not in json.dumps(frappe.db.sql("select value from tabSingles where doctype like '%%Settings'"), default=str))
 
     # ---- P purge
     for i in range(25):
@@ -434,9 +439,34 @@ def run():
     check("F2 feed check finds the line in ERPNext and at Airwallex",
           fc["txn"]["in_erpnext"] and fc["txn"]["would_go_to"] == accts["FT AWX AUD"], fc["txn"])
 
+    # ---- G the Bank Feeds page
+    from bank_integration.feed import page as bkf
+
+    ov = bkf.overview()
+    check("G1 page lists both providers", [p["key"] for p in ov["providers"]] == ["airwallex", "skript"], ov["providers"])
+    aud_row = [a for a in ov["accounts"] if a["bank_account"] == accts["FT AWX AUD"]]
+    check("G2 page row per bank account with its last line", aud_row and aud_row[0]["last_date"] and aud_row[0]["currency"] == "AUD", aud_row)
+    tc = bkf.test_connection("airwallex")
+    check("G3 test connection reads Airwallex", tc["logins"] and tc["logins"][0]["ok"], tc)
+    frappe.db.set_single_value("Airwallex Settings", "sync_schedule", "Daily", update_modified=False)
+    frappe.db.commit()
+    awx.lines.append(line(950, now - timedelta(minutes=1)))
+    sync_scheduled_transactions(None, "Hourly")
+    check("G4 hourly run skips when set to Daily", not bt("ft-950"))
+    frappe.db.set_single_value("Airwallex Settings", "enable_log", 1, update_modified=False)
+    frappe.db.commit()
+    sync_scheduled_transactions(None, None, force=True)
+    frappe.db.set_single_value("Airwallex Settings", "enable_log", 0, update_modified=False)
+    check("G5 Sync now runs whatever the schedule", bool(bt("ft-950")))
+    frappe.db.set_single_value("Airwallex Settings", "sync_schedule", "Hourly", update_modified=False)
+    frappe.db.commit()
+    log_rows = frappe.get_all("Bank Integration Log", filters={"creation": [">=", now], "url": ["is", "set"]}, fields=["provider"])
+    check("G6 call rows carry their provider", log_rows and all(r.provider == "Airwallex" for r in log_rows),
+          {r.provider for r in log_rows})
+
     # ---- R config problems are words, not crashes
     frappe.db.set_value("Account", frappe.db.get_value("Bank Account", accts["FT AWX USD"], "account"), "account_currency", None)
-    s = frappe.get_single("Bank Integration Setting")
+    s = frappe.get_single("Airwallex Settings")
     from bank_integration.airwallex.transaction import client_routes
 
     lg, probs = client_routes(s)
@@ -458,18 +488,47 @@ def run():
     sk.size_cap = 4
     sk.lines = [sline(i, "acc-cba", now - timedelta(hours=3, minutes=i)) for i in range(1, 11)]
     sk.lines += [sline(50, "acc-new", now - timedelta(hours=2))]
-    sync_scheduled_transactions_skript("Bank Integration Setting", "Hourly")
+    sync_scheduled_transactions_skript(None, "Hourly")
     check("S1 Skript: every line in although each page is full", all(bt(f"ft-s{i}") for i in range(1, 11)),
           ([i for i in range(1, 11) if not bt(f"ft-s{i}")], [c[2].get("filter") for c in sk.calls],
-           frappe.db.get_single_value("Bank Integration Setting", "skript_sync_report"),
+           frappe.db.get_single_value("Skript Settings", "sync_report"),
            frappe.get_all("Error Log", {"creation": [">", now]}, ["method", "error"])[-2:]))
     check("S2 Skript: an unmapped account does not stop the rest", not bt("ft-s50") and bt("ft-s1"))
     # Judo posts late: a line posted 3 days back arrives after CBA's newer ones went in
     sk.lines += [sline(60, "acc-judo", now - timedelta(days=3))]
-    sync_scheduled_transactions_skript("Bank Integration Setting", "Hourly")
+    sync_scheduled_transactions_skript(None, "Hourly")
     check("S3 Skript: a late-posted Judo line is picked up", bool(bt("ft-s60")))
-    srep = json.loads(frappe.db.get_single_value("Bank Integration Setting", "skript_sync_report"))
+    srep = json.loads(frappe.db.get_single_value("Skript Settings", "sync_report"))
     check("S4 Skript report per account", "Judo LOC 5803" in srep["accounts"], list(srep["accounts"]))
+    frappe.db.commit()
+
+    # ---- M the split patch, on old-shaped data
+    from bank_integration.patches.v1_1 import split_provider_settings as patch
+    from frappe.utils.password import get_decrypted_password, set_encrypted_password
+
+    old = "Bank Integration Setting"
+    for dt in ("Airwallex Settings", "Skript Settings"):
+        frappe.db.sql("delete from tabSingles where doctype=%s and field in ('api_url','enabled','last_sync_date','consumer_id')", dt)
+    frappe.db.sql("update `tabAirwallex Client` set parent=%s, parenttype=%s, parentfield='airwallex_clients'", (old, old))
+    frappe.db.sql("update `tabSkript Account` set parent=%s, parenttype=%s, parentfield='skript_accounts'", (old, old))
+    frappe.db.sql("delete from __Auth where doctype='Skript Settings'")
+    set_encrypted_password(old, old, "OLD-SECRET", "skript_client_secret")
+    for f, v in (("enable_airwallex", 1), ("api_url", "https://old.test/api/v1"), ("last_sync_date", "2026-11-03 03:00:00"),
+                 ("skript_consumer_id", "OLDCONSUMER"), ("enable_skript", 1), ("skript_access_token", "PLAIN")):
+        frappe.db.sql("insert into tabSingles (doctype, field, value) values (%s, %s, %s)", (old, f, v))
+    patch.execute()
+    a = frappe.get_single("Airwallex Settings")
+    k = frappe.get_single("Skript Settings")
+    check("M1 values moved", a.api_url == "https://old.test/api/v1" and str(a.last_sync_date).startswith("2026-11-03")
+          and k.consumer_id == "OLDCONSUMER", (a.api_url, a.last_sync_date, k.consumer_id))
+    check("M2 client rows moved with their names and keys",
+          len(a.clients) == 2 and all(r.get_password("airwallex_api_key") == "LONGLIFE-API-KEY-XYZ" for r in a.clients))
+    check("M3 Skript accounts moved", len(k.accounts) == 3)
+    check("M4 Skript secret moved", get_decrypted_password("Skript Settings", "Skript Settings", "client_secret") == "OLD-SECRET")
+    check("M5 nothing left on the old record (plain token gone)",
+          not frappe.db.sql("select count(*) from tabSingles where doctype=%s", old)[0][0])
+    patch.execute()
+    check("M6 running it again changes nothing", len(frappe.get_single("Airwallex Settings").clients) == 2)
     frappe.db.commit()
 
 

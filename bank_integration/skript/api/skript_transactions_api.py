@@ -96,18 +96,18 @@ def test_get_transactions():
     Test function to fetch transactions
     Usage: bench execute bank_integration.skript.api.transactions.test_get_transactions
     """
-    settings = frappe.get_single("Bank Integration Setting")
+    settings = frappe.get_single("Skript Settings")
     
-    if not settings.enable_skript:
+    if not settings.enabled:
         print("Skript is not enabled")
         return
     
     api = SkriptTransactions(
-        consumer_id=settings.skript_consumer_id,
-        client_id=settings.get_password("skript_client_id"),
-        client_secret=settings.get_password("skript_client_secret"),
-        api_url=settings.skript_api_url,
-        api_scope=settings.skript_api_scope
+        consumer_id=settings.consumer_id,
+        client_id=settings.get_password("client_id"),
+        client_secret=settings.get_password("client_secret"),
+        api_url=settings.api_url,
+        api_scope=settings.api_scope
     )
     
     try:

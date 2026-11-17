@@ -1,5 +1,5 @@
-"""Scheduled Skript runs. Whether another run is going, or died and left
-the lock, is decided inside sync_scheduled_transactions_skript."""
+"""Kept so a job queued before the 17 Nov 26 change still runs. The
+schedule now calls bank_integration.feed.scheduler."""
 
 import frappe
 
@@ -8,7 +8,7 @@ from bank_integration.skript.skript_transaction import sync_scheduled_transactio
 
 def _run(schedule_type):
     try:
-        sync_scheduled_transactions_skript("Bank Integration Setting", schedule_type)
+        sync_scheduled_transactions_skript(None, schedule_type)
     except Exception:
         frappe.log_error(frappe.get_traceback(), f"Skript {schedule_type} sync error")
 

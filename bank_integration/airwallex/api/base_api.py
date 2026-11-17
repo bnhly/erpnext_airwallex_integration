@@ -23,20 +23,20 @@ class AirwallexBase:
             self.api_key = api_key
             self.api_url = api_url or self._get_api_url()
         else:
-            # Fallback to first client for backward compatibility
-            settings = frappe.get_single("Bank Integration Setting")
-            if settings.airwallex_clients:
-                first_client = settings.airwallex_clients[0]
+            # No login given: the first row on Airwallex Settings.
+            settings = frappe.get_single("Airwallex Settings")
+            if settings.clients:
+                first_client = settings.clients[0]
                 self.client_id = first_client.airwallex_client_id
-                self.api_key = first_client.airwallex_api_key
+                self.api_key = first_client.get_password("airwallex_api_key")
                 self.api_url = settings.api_url
             else:
                 frappe.throw("No Airwallex clients configured")
 
         self.base_url = self.api_url
-        # Follow the Enable Log tick on Bank Integration Setting (was always on).
+        # Follow the Log Every Call tick on Airwallex Settings (was always on).
         # Errors are still logged when it is off.
-        self.enable_api_log = bool(frappe.db.get_single_value("Bank Integration Setting", "enable_log"))
+        self.enable_api_log = bool(frappe.db.get_single_value("Airwallex Settings", "enable_log"))
 
         # Set headers based on whether this is for authentication or API calls
         if use_auth_headers:
@@ -304,6 +304,7 @@ class AirwallexBase:
                     message = "Logged in"
             log = frappe.get_doc({
                 "doctype": "Bank Integration Log",
+                "provider": "Airwallex",
                 "status": str(status_string),
                 "message": str(message),
                 "response_data": str(response) if response else "",
@@ -324,10 +325,9 @@ class AirwallexBase:
     def _get_api_url(self):
         """Get API URL from settings"""
         try:
-            settings = frappe.get_single("Bank Integration Setting")
-            return settings.api_url or "https://api.airwallex.com"
+            return frappe.db.get_single_value("Airwallex Settings", "api_url") or "https://api.airwallex.com/api/v1"
         except:
-            return "https://api.airwallex.com"
+            return "https://api.airwallex.com/api/v1"
 
 
 # Add a custom exception class
