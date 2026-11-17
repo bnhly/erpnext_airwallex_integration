@@ -1,120 +1,39 @@
+"""Scheduled Skript runs. Whether another run is going, or died and left
+the lock, is decided inside sync_scheduled_transactions_skript."""
+
 import frappe
-from bank_integration.skript.skript_transaction import (
-    sync_scheduled_transactions_skript,
-)
+
+from bank_integration.skript.skript_transaction import sync_scheduled_transactions_skript
+
+
+def _run(schedule_type):
+    try:
+        sync_scheduled_transactions_skript("Bank Integration Setting", schedule_type)
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), f"Skript {schedule_type} sync error")
 
 
 def run_hourly_skript_sync():
-    """Run hourly sync for Skript if enabled"""
-    try:
-        setting = frappe.get_single("Bank Integration Setting")
-
-        if (
-            setting.enable_skript
-            and setting.skript_sync_schedule == "Hourly"  # ← Changed
-            and setting.skript_sync_status != "In Progress"
-        ):  # ← Changed
-            sync_scheduled_transactions_skript("Bank Integration Setting", "Hourly")
-
-    except Exception as e:
-        frappe.log_error(frappe.get_traceback(), "Skript Hourly Sync Error")
+    _run("Hourly")
 
 
 def run_daily_skript_sync():
-    """Run daily sync for Skript if enabled"""
-    try:
-        setting = frappe.get_single("Bank Integration Setting")
-
-        if (
-            setting.enable_skript
-            and setting.skript_sync_schedule == "Daily"
-            and setting.skript_sync_status != "In Progress"
-        ):
-            sync_scheduled_transactions_skript("Bank Integration Setting", "Daily")
-
-    except Exception as e:
-        frappe.log_error(frappe.get_traceback(), "Skript Daily Sync Error")
+    _run("Daily")
 
 
 def run_weekly_skript_sync():
-    """Run weekly sync for Skript if enabled"""
-    try:
-        setting = frappe.get_single("Bank Integration Setting")
-
-        if (
-            setting.enable_skript
-            and setting.skript_sync_schedule == "Weekly"
-            and setting.skript_sync_status != "In Progress"
-        ):
-            sync_scheduled_transactions_skript("Bank Integration Setting", "Weekly")
-
-    except Exception as e:
-        frappe.log_error(frappe.get_traceback(), "Skript Weekly Sync Error")
+    _run("Weekly")
 
 
 def run_monthly_skript_sync():
-    """Run monthly sync for Skript if enabled"""
-    try:
-        setting = frappe.get_single("Bank Integration Setting")
-
-        if (
-            setting.enable_skript
-            and setting.skript_sync_schedule == "Monthly"
-            and setting.skript_sync_status != "In Progress"
-        ):
-            sync_scheduled_transactions_skript("Bank Integration Setting", "Monthly")
-
-    except Exception as e:
-        frappe.log_error(frappe.get_traceback(), "Skript Monthly Sync Error")
+    _run("Monthly")
 
 
 def complete_skript_sync():
-    """Find START scheduler jobs and mark them completed"""
+    """Retired 17 Nov 26 (taken off the 23:00 schedule in hooks.py).
 
-    try:
-        setting = frappe.get_single("Bank Integration Setting")
-
-        if not setting.enable_skript:
-            frappe.log(
-                "Skript sync not in progress or not enabled; skipping completion."
-            )
-            return
-
-        # Get all START jobs (latest first)
-        jobs = frappe.db.get_all(
-            "Scheduled Job Log",
-            filters={
-                "scheduled_job_type": "skript_scheduler.run_hourly_skript_sync",
-                "status": "Start",
-                "creation": (
-                    "<=",
-                    frappe.utils.add_to_date(frappe.utils.now(), hours=-1),
-                ),
-            },
-            fields=["name", "creation"],
-            order_by="creation desc",
-        )
-
-        # Nothing to process
-        if not jobs:
-            return
-
-        for job in jobs:
-            # Mark scheduler job as completed
-            frappe.db.set_value(
-                "Scheduled Job Log",
-                job.name,
-                {
-                    "status": "Complete",
-                },
-                update_modified=False,
-            )
-
-        # Mark Skript sync as completed (only once)
-        setting.skript_sync_status = "Completed"
-        setting.save(ignore_permissions=True)
-
-        frappe.db.commit()
-
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), "Skript Sync Completion Error")
+    It marked Scheduled Job Log rows Complete and forced the Skript status
+    to Completed every night, whatever was running. The lock now times out
+    on its own (feed/common.py). Kept so an old queued call does not fail.
+    """
+    return

@@ -1,358 +1,257 @@
+"""Skript bank feed (CBA, Judo) into Bank Transaction.
+
+Rewritten 17 Nov 26 with the Airwallex feed (see airwallex/transaction.py
+and feed/common.py for the rules): look-back window, a savepoint per line,
+failures kept and not skipped past, a stale lock taken over, every page read.
+"""
 import frappe
 from bank_integration.skript.api.skript_transactions_api import SkriptTransactions
 from bank_integration.skript.api.skript_base_api import SkriptAPIError
 from bank_integration.skript.skript_utils import map_skript_to_erpnext, format_datetime_for_skript_filter , parse_skript_to_system_timezone
-from datetime import datetime , timedelta
-import traceback
+from frappe.utils import get_datetime
+
+from bank_integration.bank_integration.doctype.bank_integration_log import bank_integration_log as bi_log
+from bank_integration.feed import common
 
 
-# def sync_skript_transactions(setting_name , from_date = None, to_date = None):
-#     """
-#     Sync Skript transactions for the configured consumer
-#     """
-#     settings = frappe.get_doc("Bank Integration Setting", setting_name)
-    
-#     if not settings.enable_skript:
-#         frappe.logger().info("Skript integration is not enabled")
-#         return
-    
-#     # Validate account mapping
-#     unmapped = []
-#     for row in settings.skript_accounts:
-#         if not row.bank_account:
-#             unmapped.append(row.display_name or row.account_id)
-    
-#     if unmapped:
-#         error_msg = f"Cannot sync - unmapped accounts: {', '.join(unmapped)}"
-#         frappe.logger().error(error_msg)
-#         settings.update_skript_sync_progress(0, 0, "Failed", False)  # ← Changed
-#         frappe.throw(error_msg)
-#         return 0, 0
-    
-#     # Build account mapping dictionary
-#     account_map = {}
-#     for row in settings.skript_accounts:
-#         account_map[row.account_id] = row.bank_account
-    
-#     try:
-#         # Initialize API
-#         api = SkriptTransactions(
-#             consumer_id=settings.skript_consumer_id,
-#             client_id=settings.get_password("skript_client_id"),
-#             client_secret=settings.get_password("skript_client_secret"),
-#             api_url=settings.skript_api_url,
-#             api_scope=settings.skript_api_scope
-#         )
-        
-#         # Format dates
-#         from_date_str = format_datetime_for_skript_filter(from_date)
-#         to_date_str = format_datetime_for_skript_filter(to_date)
-#         filter_expr = f"postingDateTime BETWEEN {{ts '{from_date_str}'}} AND {{ts '{to_date_str}'}}"
-        
-#         frappe.logger().info(f"Skript sync starting: {from_date_str} to {to_date_str}")
-        
-#         # Fetch transactions
-#         response = api.get_list_all(filter=filter_expr, size=100)
-        
-#         if isinstance(response, dict):
-#             transactions = response.get('items', response.get('data', []))
-#         else:
-#             transactions = response if isinstance(response, list) else []
-        
-#         if not transactions:
-#             frappe.logger().info("No Skript transactions found")
-#             settings.update_skript_sync_progress(0, 0, "Completed" , False)  # ← Changed
-#             return 0, 0
-        
-#         processed = 0
-#         created = 0
-#         skipped = 0
-#         errors = 0
-#         latest_modified = None
-#         for txn in transactions:
-#             try:
-#                 pdt = parse_skript_to_system_timezone(txn.get('postingDateTime'))
-#                 if not latest_modified or pdt > latest_modified:
-#                     latest_modified = pdt
-#                 frappe.log_error(title="Skript Transaction", message=f"{latest_modified}")
+STATUS_F = "skript_sync_status"
+STARTED_F = "skript_sync_started_on"
+REPORT_F = "skript_sync_report"
+CURSOR_F = "skript_last_sync_date"
+PAGE_SIZE = 1000
+MAX_PAGES = 100
 
-#                 transaction_id = txn.get('id')
-#                 account_id = txn.get('accountId')
-                
-#                 if not account_id:
-#                     skipped += 1
-#                     processed += 1
-#                     continue
-                
-#                 bank_account = account_map.get(account_id)
-                
-#                 if not bank_account:
-#                     skipped += 1
-#                     processed += 1
-#                     continue
-                
-#                 if transaction_exists(transaction_id):
-#                     skipped += 1
-#                     processed += 1
-#                     continue
-                
-#                 bank_txn = map_skript_to_erpnext(txn, bank_account)
-#                 bank_txn_doc = frappe.get_doc(bank_txn)
-#                 bank_txn_doc.insert()
-#                 bank_txn_doc.submit()
-                
-#                 created += 1
-#                 processed += 1
-                
-#                 # Update progress every 10 transactions
-#                 if processed % 10 == 0:
-#                     settings.update_skript_sync_progress(processed, len(transactions), "In Progress", False)  # ← Changed
-            
-#             except Exception as txn_error:
-#                 errors += 1
-#                 frappe.log_error(
-#                     f"Failed to process Skript transaction {txn.get('id', 'unknown')}: {str(txn_error)}\n{traceback.format_exc()}",
-#                     "Skript Transaction Error"
-#                 )
-#                 processed += 1
-        
-#         # Final update
-#         final_status = "Completed" if errors == 0 else "Completed with Errors"
-#         settings.update_skript_sync_progress(processed, len(transactions), final_status, False)  # ← Changed
-#         if latest_modified:
-#             settings.db_set('skript_last_sync_date', latest_modified.strftime("%Y-%m-%d %H:%M:%S"))  # ← Changed
-        
-#         frappe.logger().info(
-#             f"Skript sync completed: Processed {processed}, Created {created}, "
-#             f"Skipped {skipped}, Errors {errors}"
-#         )
-        
-#         return processed, created
-    
-#     except Exception as e:
-#         settings.update_skript_sync_progress(0, 0, "Failed", False)  # ← Changed
-#         error_msg = f"Skript sync failed: {str(e)}"
-#         frappe.log_error(f"{error_msg}\n{traceback.format_exc()}", "Skript Sync Error")
-#         frappe.logger().error(error_msg)
-#         return 0, 0
 
-def sync_skript_transactions(setting_name, from_date=None, to_date=None):
+def _items(response):
+    if isinstance(response, list):
+        return response
+    if isinstance(response, dict):
+        data = response.get("items")
+        if data is None:
+            data = response.get("data")
+        if isinstance(data, dict):
+            data = data.get("transactions") or data.get("items") or []
+        return data or []
+    return []
+
+
+def _next_ref(response):
+    if not isinstance(response, dict):
+        return None
+    for key in ("ref", "nextRef", "next_ref"):
+        if response.get(key):
+            return response[key]
+    links = response.get("links") or {}
+    if isinstance(links, dict) and links.get("next"):
+        nxt = str(links["next"])
+        if "ref=" in nxt:
+            return nxt.split("ref=", 1)[1].split("&", 1)[0]
+    meta = response.get("meta") or {}
+    if isinstance(meta, dict):
+        for key in ("ref", "nextRef", "next"):
+            if meta.get(key):
+                return meta[key]
+    return None
+
+
+def fetch_window(api, from_dt, to_dt):
+    """Every Skript transaction posted in [from_dt, to_dt], across all pages.
+
+    Skript pages with a ref when it gives one. When it gives none and a page
+    comes back with anything new, the next call asks again from the latest
+    posting time seen (ties caught by the id check); it stops when a call
+    brings nothing new.
     """
-    Sync Skript transactions iteratively until no more records are found.
-    Uses a 'Watermark' strategy: fetch > last_sync_date.
+    from_s = format_datetime_for_skript_filter(from_dt)
+    to_s = format_datetime_for_skript_filter(to_dt)
+    lower = from_s
+    seen = {}
+    ref = None
+    for _ in range(MAX_PAGES):
+        expr = f"postingDateTime BETWEEN {{ts '{lower}'}} AND {{ts '{to_s}'}}"
+        response = api.get_list_all(filter=expr, size=PAGE_SIZE, ref=ref)
+        batch = _items(response)
+        fresh = [t for t in batch if t.get("id") not in seen]
+        for t in fresh:
+            seen[t.get("id")] = t
+        if not batch or not fresh:
+            break
+        ref = _next_ref(response)
+        if ref:
+            continue
+        # No ref: ask again from the latest posting time seen. Skript may
+        # cap a page below what was asked, so a short page is not proof of
+        # the end; a page with nothing new is. Costs one extra call a run.
+        latest = max(parse_skript_to_system_timezone(t.get("postingDateTime")) for t in batch)
+        lower = format_datetime_for_skript_filter(latest)
+    else:
+        raise SkriptAPIError(f"Stopped after {MAX_PAGES} pages; narrow the date range", 500)
+    return list(seen.values())
+
+
+def run_window(settings, from_dt, to_dt, dry_run=False):
+    """Bring in the Skript lines posted in the window that ERPNext lacks.
+
+    Each line on its own savepoint; failures kept in the report. Lines on a
+    Skript account with no ERPNext Bank Account are counted, not an error
+    for the rest (before 17 Nov 26 one unmapped account stopped the lot).
     """
-    settings = frappe.get_doc("Bank Integration Setting", setting_name)
-    
-    if not settings.enable_skript:
-        frappe.logger().info("Skript integration is not enabled")
-        return 0, 0
-    
-    # --- 1. Validate Mapping ---
-    unmapped = []
-    for row in settings.skript_accounts:
-        if not row.bank_account:
-            unmapped.append(row.display_name or row.account_id)
-    
-    if unmapped:
-        error_msg = f"Cannot sync - unmapped accounts: {', '.join(unmapped)}"
-        frappe.logger().error(error_msg)
-        settings.update_skript_sync_progress(0, 0, "Failed", False)
-        frappe.throw(error_msg)
-        return 0, 0
-    
-    account_map = {row.account_id: row.bank_account for row in settings.skript_accounts}
-    
-    try:
-        # --- 2. Initialize API ---
-        api = SkriptTransactions(
-            consumer_id=settings.skript_consumer_id,
-            client_id=settings.get_password("skript_client_id"),
-            client_secret=settings.get_password("skript_client_secret"),
-            api_url=settings.skript_api_url,
-            api_scope=settings.skript_api_scope
-        )
-
-        total_processed = 0
-        total_created = 0
-        total_errors = 0
-        
-        # Determine the initial start time for the sync loop
-        # Priority: 1. DB Last Sync, 2. Manual from_date, 3. Default (30 days ago)
-        current_cursor = None
-        
-        if settings.skript_last_sync_date:
-            current_cursor = frappe.utils.get_datetime(from_date)
-        elif from_date:
-            current_cursor = frappe.utils.get_datetime(from_date)
+    report = {
+        "window": [str(from_dt), str(to_dt)],
+        "dry_run": bool(dry_run),
+        "problems": [],
+        "accounts": {},
+        "failed": [],
+        "would_add": [],
+        "created": 0,
+    }
+    account_map = {}
+    names = {}
+    for row in settings.skript_accounts or []:
+        names[row.account_id] = row.display_name or row.masked_number or row.account_id
+        if row.bank_account:
+            account_map[row.account_id] = row.bank_account
         else:
-            # Fallback: If never synced, look back 30 days
-            current_cursor = frappe.utils.add_days(frappe.utils.now(), -30)
+            report["problems"].append(f"Skript account {names[row.account_id]} has no Bank Account")
 
-        loop_count = 0
-        MAX_LOOPS = 100  # Safety break to prevent infinite loops
+    api = SkriptTransactions(
+        consumer_id=settings.skript_consumer_id,
+        client_id=settings.get_password("skript_client_id"),
+        client_secret=settings.get_password("skript_client_secret"),
+        api_url=settings.skript_api_url,
+        api_scope=settings.skript_api_scope,
+    )
+    lines = fetch_window(api, from_dt, to_dt)
+    have = common.existing_ids([t.get("id") for t in lines])
 
-        # --- 3. Sync Loop ---
-        while True:
-            loop_count += 1
-            if loop_count > MAX_LOOPS:
-                frappe.logger().warning("Skript Sync hit max loop limit (100 batches). Stopping safely.")
-                break
-
-            # Format the filter date
-            filter_date_str = format_datetime_for_skript_filter(current_cursor)
-            
-            # Construct Filter: postingDateTime > Last Sync
-            filter_expr = f"postingDateTime > {{ts '{filter_date_str}'}}"
-            
-            frappe.logger().info(f"Skript Sync Batch {loop_count}: Fetching > {filter_date_str}")
-            
-            # Fetch transactions
-            response = api.get_list_all(filter=filter_expr, size=100)
-            
-            # Normalize response
-            if isinstance(response, dict):
-                transactions = response.get('items', response.get('data', []))
-            else:
-                transactions = response if isinstance(response, list) else []
-            
-            # --- EXIT CONDITION: No more data ---
-            if not transactions:
-                frappe.logger().info("No more Skript transactions found. Sync complete.")
-                break
-            
-            batch_processed = 0
-            batch_max_date = None
-            
-            for txn in transactions:
-                try:
-                    # Track the latest date in this batch for the next loop
-                    # Using parse_skript_date from utils (assuming it returns datetime)
-                    txn_dt = parse_skript_to_system_timezone(txn.get('postingDateTime'))
-                    
-                    # Update local batch max
-                    if not batch_max_date or (txn_dt and txn_dt > batch_max_date):
-                        batch_max_date = txn_dt + timedelta(seconds=1)
-
-                    # Business Logic
-                    transaction_id = txn.get('id')
-                    account_id = txn.get('accountId')
-                    
-                    if not account_id or not account_map.get(account_id):
-                        total_processed += 1
-                        continue
-                        
-                    if transaction_exists(transaction_id):
-                        total_processed += 1
-                        continue
-                    
-                    bank_account = account_map.get(account_id)
-                    bank_txn = map_skript_to_erpnext(txn, bank_account)
-                    
-                    bank_txn_doc = frappe.get_doc(bank_txn)
-                    bank_txn_doc.insert()
-                    bank_txn_doc.submit()
-                    
-                    total_created += 1
-                    total_processed += 1
-                    batch_processed += 1
-
-                except Exception as txn_error:
-                    total_errors += 1
-                    frappe.log_error(
-                        f"Skript Txn Error {txn.get('id')}: {str(txn_error)}",
-                        "Skript Transaction Error"
-                    )
-            
-            # --- 4. Update Watermark & Save Progress ---
-            # If we found a newer date in this batch, update settings immediately
-            if batch_max_date and batch_max_date > current_cursor:
-                current_cursor = batch_max_date
-                settings.db_set('skript_last_sync_date', current_cursor.strftime("%Y-%m-%d %H:%M:%S"))
-                settings.save()
-                frappe.db.commit() # Commit explicitly to save progress
-            # Update Progress Bar (optional)
-            settings.update_skript_sync_progress(total_processed, total_processed + 100, "In Progress", False)
-
-        # Final Status Update
-        final_status = "Completed" if total_errors == 0 else "Completed with Errors"
-        settings.update_skript_sync_progress(total_processed, total_processed, final_status, False)
-        
-        return total_processed, total_created
-    
-    except Exception as e:
-        settings.update_skript_sync_progress(0, 0, "Failed", False)
-        error_msg = f"Skript sync failed: {str(e)}"
-        frappe.log_error(f"{error_msg}\n{traceback.format_exc()}", "Skript Sync Error")
-        frappe.logger().error(error_msg)
-        return 0, 0
-
-
-
-def sync_scheduled_transactions_skript(setting_name, schedule_type):
-    """Sync transactions based on schedule type"""
-    from datetime import datetime, timedelta
-    
-    try:
-        setting = frappe.get_single("Bank Integration Setting")
-        
-        # Check if sync is already in progress
-        if setting.skript_sync_status == "In Progress":
-            # Safety check: if stuck in progress for > 1 hour, reset it
-            if setting.modified and (frappe.utils.now_datetime() - frappe.utils.get_datetime(setting.modified)).total_seconds() > 3600:
-                 frappe.logger().info("Resetting stuck Skript sync status")
-                 setting.db_set('skript_sync_status', 'Not Started')  # ← Changed
-            else:
-                 frappe.logger().info(f"Skript sync already in progress")
-                 return
-        
-        if not setting.enable_skript:
-            frappe.logger().info("Skript integration disabled")
-            return
-        
-        # Check if schedule matches
-        if setting.skript_sync_schedule != schedule_type:  # ← Changed
-            return
-        
-        # Set status
-        setting.db_set('skript_sync_status', 'In Progress')  # ← Changed
-        
-        # Calculate date range
-        end_date = frappe.utils.now_datetime()
-        
-        if setting.skript_last_sync_date:  # ← Changed
-            start_date = frappe.utils.get_datetime(setting.skript_last_sync_date)
-        else:
-            if schedule_type == "Hourly":
-                start_date = end_date - timedelta(hours=1)
-            elif schedule_type == "Daily":
-                start_date = end_date - timedelta(days=1)
-            elif schedule_type == "Weekly":
-                start_date = end_date - timedelta(days=7)
-            elif schedule_type == "Monthly":
-                start_date = end_date - timedelta(days=30)
-            else:
-                setting.db_set('skript_sync_status', 'Failed')  # ← Changed
-                return
-        
-        frappe.logger().info(f"Scheduled Skript {schedule_type} sync: {start_date} to {end_date}")
-        
-        # Sync
-        sync_skript_transactions( "Bank Integration Setting", start_date, end_date)
-        
-    except Exception as e:
+    for n, txn in enumerate(lines):
+        acc = txn.get("accountId")
+        label = names.get(acc) or acc or "none"
+        part = report["accounts"].setdefault(label, {
+            "bank_account": account_map.get(acc), "fetched": 0, "existing": 0,
+            "created": 0, "failed": 0, "unmapped": 0, "last_posted": None,
+        })
+        part["fetched"] += 1
+        posted = txn.get("postingDateTime")
+        if posted and (not part["last_posted"] or str(posted) > str(part["last_posted"])):
+            part["last_posted"] = posted
+        if txn.get("id") in have:
+            part["existing"] += 1
+            continue
+        bank_account = account_map.get(acc)
+        if not bank_account:
+            part["unmapped"] += 1
+            continue
+        brief = {
+            "id": txn.get("id"), "when": parse_skript_to_system_timezone(posted),
+            "amount": txn.get("amount"), "description": (txn.get("description") or "")[:120],
+            "bank_account": bank_account,
+        }
+        if dry_run:
+            report["would_add"].append(brief)
+            continue
         try:
-            setting = frappe.get_single("Bank Integration Setting")
-            setting.db_set('skript_sync_status', 'Failed')  # ← Changed
-        except:
-            pass
-        
-        error_msg = f"Scheduled Skript {schedule_type} sync failed: {str(e)}"
-        frappe.log_error(f"{error_msg}\n{traceback.format_exc()}", f"Skript Scheduled Sync Error")
+            doc = map_skript_to_erpnext(txn, bank_account)
+        except Exception as e:  # noqa: BLE001
+            doc, fail = None, common.clean_reason(e)
+        else:
+            name, fail = common.insert_line(doc, f"skript_line_{n}")
+            if name:
+                part["created"] += 1
+                report["created"] += 1
+                if report["created"] % common.COMMIT_EVERY == 0:
+                    frappe.db.commit()
+                continue
+        part["failed"] += 1
+        brief["reason"] = fail
+        report["failed"].append(brief)
+    return report
+
+
+def _finish(report, run, started, status):
+    report["run"] = run
+    report["started"] = str(started)
+    report["ended"] = str(frappe.utils.now_datetime())
+    report["status"] = status
+    if common.has_field(REPORT_F):
+        common.save_report(REPORT_F, report)
+
+
+def _claim(run):
+    try:
+        note = common.claim_lock(STATUS_F, STARTED_F, "Skript")
+    except common.FeedBusy as e:
+        frappe.logger("bank_integration").info(str(e))
+        return False
+    if note:
+        bi_log.create_log(note, status="Error")
+    return True
+
+
+def sync_skript_transactions(setting_name=None, from_date=None, to_date=None, run="sync old", **kwargs):
+    """A manual range (the Skript "Sync old" button, or catch-up). Takes the
+    same lock as the scheduled run and never moves the scheduled start."""
+    settings = frappe.get_single(common.SETTINGS)
+    if not settings.enable_skript:
+        return None
+    if not _claim(run):
+        return {"busy": True}
+    started = frappe.utils.now_datetime()
+    status = "Failed"
+    report = None
+    try:
+        report = run_window(settings, get_datetime(from_date), get_datetime(to_date or started))
+        status = "Completed with Errors" if report["failed"] else "Completed"
+        _finish(report, run, started, status)
+        _log_summary(run, report)
+    except Exception:
+        frappe.db.rollback()
+        frappe.log_error(frappe.get_traceback(), f"Skript {run} failed")
+    finally:
+        common.release_lock(STATUS_F, status)
+    return report
+
+
+def sync_scheduled_transactions_skript(setting_name=None, schedule_type=None):
+    """The scheduled run: window from the last good run less the look-back.
+
+    One window for every account. The old code moved one cursor to the
+    latest posting time on ANY account, so an account that posts late (Judo)
+    lost every line posted before CBA's latest; the look-back covers that.
+    """
+    settings = frappe.get_single(common.SETTINGS)
+    if not settings.enable_skript or settings.skript_sync_schedule != schedule_type:
+        return
+    if not _claim("scheduled run"):
+        return
+    started = frappe.utils.now_datetime()
+    status = "Failed"
+    try:
+        first_days = {"Hourly": 1, "Daily": 2, "Weekly": 8, "Monthly": 31}.get(schedule_type, 1)
+        from_dt = common.window_start(settings.get(CURSOR_F), first_days)
+        report = run_window(settings, from_dt, started)
+        status = "Completed with Errors" if report["failed"] else "Completed"
+        cursor = common.next_cursor(started, report["failed"], settings.get(CURSOR_F))
+        common.set_single(CURSOR_F, cursor)
+        _finish(report, "scheduled", started, status)
+        if report["created"] or report["failed"]:
+            _log_summary("scheduled run", report)
+    except Exception:
+        frappe.db.rollback()
+        frappe.log_error(frappe.get_traceback(), "Skript scheduled sync failed")
+    finally:
+        common.release_lock(STATUS_F, status)
+
+
+def _log_summary(run, report):
+    fails = len(report["failed"])
+    bi_log.create_log(
+        f"Skript {run}: {report['created']} added, {fails} failed, "
+        f"window {report['window'][0]} to {report['window'][1]}",
+        status="Error" if fails else "Info",
+    )
+
 
 def transaction_exists(transaction_id):
-    """
-    Check if a Bank Transaction with the given transaction ID already exists
-    """
+    """True when a Bank Transaction carries this transaction_id."""
     return frappe.db.exists("Bank Transaction", {"transaction_id": transaction_id})
-
-

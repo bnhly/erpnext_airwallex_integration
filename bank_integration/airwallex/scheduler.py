@@ -1,59 +1,33 @@
+"""Scheduled Airwallex runs. Each one runs only when it matches the chosen
+schedule. Whether another run is still going (or died and left the lock)
+is decided inside sync_scheduled_transactions, not here: the old check here
+skipped every run for good once a run died "In Progress"."""
+
 import frappe
+
 from bank_integration.airwallex.transaction import sync_scheduled_transactions
 
-def run_hourly_sync():
-    """Run hourly sync for enabled setting"""
+
+def _run(schedule_type):
     try:
-        # Get the single doctype instance
         setting = frappe.get_single("Bank Integration Setting")
+        if setting.enable_airwallex and setting.sync_schedule == schedule_type:
+            sync_scheduled_transactions("Bank Integration Setting", schedule_type)
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), f"Airwallex {schedule_type} sync error")
 
-        if (setting.enable_airwallex and
-            setting.sync_schedule == "Hourly" and
-            setting.sync_status != "In Progress"):
 
-            sync_scheduled_transactions("Bank Integration Setting", "Hourly")
+def run_hourly_sync():
+    _run("Hourly")
 
-    except Exception as e:
-        frappe.log_error(frappe.get_traceback(), f"Hourly Sync Error")
 
 def run_daily_sync():
-    """Run daily sync for enabled setting"""
-    try:
-        setting = frappe.get_single("Bank Integration Setting")
+    _run("Daily")
 
-        if (setting.enable_airwallex and
-            setting.sync_schedule == "Daily" and
-            setting.sync_status != "In Progress"):
-
-            sync_scheduled_transactions("Bank Integration Setting", "Daily")
-
-    except Exception as e:
-        frappe.log_error(frappe.get_traceback(), f"Daily Sync Error")
 
 def run_weekly_sync():
-    """Run weekly sync for enabled setting"""
-    try:
-        setting = frappe.get_single("Bank Integration Setting")
+    _run("Weekly")
 
-        if (setting.enable_airwallex and
-            setting.sync_schedule == "Weekly" and
-            setting.sync_status != "In Progress"):
-
-            sync_scheduled_transactions("Bank Integration Setting", "Weekly")
-
-    except Exception as e:
-        frappe.log_error(frappe.get_traceback(), f"Weekly Sync Error")
 
 def run_monthly_sync():
-    """Run monthly sync for enabled setting"""
-    try:
-        setting = frappe.get_single("Bank Integration Setting")
-
-        if (setting.enable_airwallex and
-            setting.sync_schedule == "Monthly" and
-            setting.sync_status != "In Progress"):
-
-            sync_scheduled_transactions("Bank Integration Setting", "Monthly")
-
-    except Exception as e:
-        frappe.log_error(frappe.get_traceback(), f"Monthly Sync Error")
+    _run("Monthly")

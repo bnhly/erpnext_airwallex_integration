@@ -282,6 +282,27 @@ def _resolve_party_name(txn, client, api_url, expense_index=None, issuing_cache=
     return ""
 
 
+def local_date(created_at):
+    """The line's date in the site's time zone.
+
+    Airwallex gives created_at in UTC. Taking its first ten characters put
+    every line made before 10 or 11 am Melbourne time on the day before,
+    which is why the Airwallex statement ran a day behind the feed
+    (17 Nov 26). Falls back to the UTC date if the value cannot be read.
+    """
+    text = str(created_at or "")
+    try:
+        import pytz
+
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = pytz.UTC.localize(dt)
+        tz = pytz.timezone(frappe.utils.get_system_timezone())
+        return dt.astimezone(tz).date().isoformat()
+    except Exception:
+        return text[:10]
+
+
 def map_airwallex_status_to_erpnext(airwallex_status):
     """
     Maps Airwallex transaction status to ERPNext Bank Transaction status.
@@ -360,7 +381,7 @@ def map_airwallex_to_erpnext(
 
     return {
         "doctype": "Bank Transaction",
-        "date": txn.get("created_at", "")[:10],  # YYYY-MM-DD
+        "date": local_date(txn.get("created_at")),
         "status": map_airwallex_status_to_erpnext(txn.get("status", "PENDING")),
         "bank_account": mapped_bank_account,
         "currency": txn_currency,

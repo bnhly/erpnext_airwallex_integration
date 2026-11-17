@@ -165,11 +165,7 @@ scheduler_events = {
         "bank_integration.airwallex.scheduler.run_monthly_sync",
         "bank_integration.skript.skript_scheduler.run_monthly_skript_sync"
     ],
-    "cron":{
-        "0 23 * * *":[
-            "bank_integration.skript.skript_scheduler.complete_skript_sync"
-        ],
-    }
+
 }
 
 # Testing
@@ -264,3 +260,9 @@ fixtures = [
     }
 ]
 export_python_type_annotations = True
+
+# Log Settings clears Bank Integration Log rows older than this many days,
+# daily (Frappe's own clean-up; the number can be changed in Log Settings).
+default_log_clearing_doctypes = {
+    "Bank Integration Log": [30],
+}

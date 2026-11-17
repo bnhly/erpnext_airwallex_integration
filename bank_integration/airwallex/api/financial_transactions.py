@@ -1,5 +1,5 @@
 import frappe
-from bank_integration.airwallex.api.base_api import AirwallexBase
+from bank_integration.airwallex.api.base_api import AirwallexBase, AirwallexAPIError
 
 
 class FinancialTransactions(AirwallexBase):
@@ -48,6 +48,57 @@ class FinancialTransactions(AirwallexBase):
             params['to_created_at'] = to_created_at
 
         return self.get(endpoint="financial_transactions", params=params)
+
+    PAGE_SIZE = 1000
+    MAX_PAGES = 200
+
+    def iter_all(self, from_created_at=None, to_created_at=None, page_size=None):
+        """Yield every financial transaction in the window, across all pages.
+
+        The list call returns one page only (100 lines unless asked). Before
+        17 Nov 26 the sync read that first page and nothing more, so a window
+        with more lines than that lost the rest. Handles both of Airwallex's
+        paging styles: page_num + has_more, and the newer page cursor
+        (page_after).
+        """
+        size = page_size or self.PAGE_SIZE
+        page_num = 0
+        cursor = None
+        seen = set()
+        for _ in range(self.MAX_PAGES):
+            params = {"page_size": size}
+            if from_created_at:
+                params["from_created_at"] = from_created_at
+            if to_created_at:
+                params["to_created_at"] = to_created_at
+            if cursor:
+                params["page"] = cursor
+            else:
+                params["page_num"] = page_num
+            data = self.get(endpoint="financial_transactions", params=params)
+            if not isinstance(data, dict):
+                data = {}
+            items = data.get("items") or data.get("data") or []
+            fresh = 0
+            for item in items:
+                key = item.get("id")
+                if key in seen:
+                    continue
+                seen.add(key)
+                fresh += 1
+                yield item
+            if not items or not fresh:
+                return
+            if data.get("page_after"):
+                cursor = data["page_after"]
+                continue
+            if data.get("has_more") or (data.get("has_more") is None and len(items) >= size):
+                page_num += 1
+                continue
+            return
+        raise AirwallexAPIError(
+            f"Stopped after {self.MAX_PAGES} pages; narrow the date range", 500
+        )
 
     def get_by_id(self, transaction_id):
         """

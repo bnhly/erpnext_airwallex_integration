@@ -99,9 +99,7 @@ class AirwallexAuthenticator(AirwallexBase):
                 frappe.log_error(f"Client document not found for client_id: {self.client_id}", "Token Cache Error")
                 return
 
-            # Calculate expiry time (typically 1 hour from now, with some buffer)
-            expires_in = token_data.get('expires_in', 3600)  # Default to 1 hour
-            expiry_time = frappe.utils.now_datetime() + timedelta(seconds=expires_in)
+            expiry_time = _token_expiry(token_data)
 
             # Update the client document
             client_doc.token = token_data.get('token')
@@ -167,9 +165,37 @@ class AirwallexAuthenticator(AirwallexBase):
 
     def handle_token_invalidation(self):
         """Handle when a token is found to be invalid - clear cache and get fresh token"""
-        frappe.log_error(
-            f"Token invalidated for client {self.client_id}, clearing cache and getting fresh token",
-            f"Token-Invalid-{self.client_id[:6]}"
+        # A token running out is normal; it was an Error Log row every time.
+        frappe.logger("bank_integration").info(
+            f"Airwallex token refused for client {self.client_id[:6]}, getting a fresh one"
         )
         self.clear_cached_token()
         return self.get_valid_token()
+
+
+def _token_expiry(token_data):
+    """When the login token stops working, in site time.
+
+    Airwallex answers {token, expires_at} (UTC), not expires_in. The old code
+    read expires_in, found none and assumed an hour, but the token lasts 30
+    minutes, so every run after the first half hour hit a 401 first. Takes
+    expires_at when present, else expires_in, else 25 minutes.
+    """
+    now = frappe.utils.now_datetime()
+    raw = token_data.get("expires_at")
+    if raw:
+        try:
+            import pytz
+
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = pytz.UTC.localize(dt)
+            tz = pytz.timezone(frappe.utils.get_system_timezone())
+            return dt.astimezone(tz).replace(tzinfo=None)
+        except Exception:
+            pass
+    try:
+        secs = int(token_data.get("expires_in") or 0)
+    except (TypeError, ValueError):
+        secs = 0
+    return now + timedelta(seconds=secs or 25 * 60)

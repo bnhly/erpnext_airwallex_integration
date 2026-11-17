@@ -29,6 +29,10 @@ class BankIntegrationSetting(Document):
         file_url: DF.Data | None
         from_date: DF.Datetime | None
         last_sync_date: DF.Datetime | None
+        sync_started_on: DF.Datetime | None
+        sync_report: DF.LongText | None
+        skript_sync_started_on: DF.Datetime | None
+        skript_sync_report: DF.LongText | None
         processed_records: DF.Int
         skript_access_token: DF.SmallText | None
         skript_access_token_url: DF.Data | None
@@ -181,7 +185,8 @@ class BankIntegrationSetting(Document):
             self.processed_records = 0
             self.total_records = 0
             self.sync_progress = 0
-            self.last_sync_date = None
+            # last_sync_date is kept: turning the feed off and on again must
+            # not lose the lines from while it was off.
 
         # Skript validation
         if self.enable_skript:
@@ -312,8 +317,9 @@ class BankIntegrationSetting(Document):
             frappe.throw("From date cannot be greater than To date")
 
         # Update status to indicate sync has started
-        self.db_set('sync_status', 'In Progress')
-        self.db_set('last_sync_date', frappe.utils.now())
+        # The job takes the feed's lock itself (feed/common.py). It no longer
+        # sets last_sync_date: that is the scheduled run's start point, and
+        # moving it to now skipped every line since the last scheduled run.
         self.db_set('processed_records', 0)
         self.db_set('total_records', 0)
         self.db_set('sync_progress', 0)
@@ -325,7 +331,8 @@ class BankIntegrationSetting(Document):
             timeout=3600,  # 1 hour timeout
             from_date=str(self.from_date),
             to_date=str(self.to_date),
-            setting_name=self.name
+            setting_name=self.name,
+            run="sync old",
         )
 
         frappe.msgprint(
@@ -590,8 +597,7 @@ class BankIntegrationSetting(Document):
         if self.skript_from_date > self.skript_to_date:
             frappe.throw("From date cannot be greater than To date")
         
-        # Update Skript sync status
-        self.db_set('skript_sync_status', 'In Progress')
+        # The job takes the feed's lock itself (feed/common.py).
         # self.db_set('skript_last_sync_date', frappe.utils.now())
         self.db_set('skript_processed_records', 0)
         self.db_set('skript_total_records', 0)

@@ -15,9 +15,11 @@
   "sync_status",
   "column_break_sync",
   "last_sync_date",
+  "sync_started_on",
   "sync_progress",
   "total_records",
   "processed_records",
+  "sync_report",
   "airwallex_tab",
   "api_details_section",
   "api_url",
@@ -49,11 +51,13 @@
   "skript_sync_status",
   "column_break_skript_sync",
   "skript_last_sync_date",
+  "skript_sync_started_on",
   "skript_sync_progress",
   "section_break_skript_records",
   "skript_total_records",
   "column_break_skript_processed",
   "skript_processed_records",
+  "skript_sync_report",
   "skript_sync_old_section",
   "skript_sync_old_transactions",
   "column_break_skript_dates",
@@ -135,7 +139,7 @@
   {
    "fieldname": "last_sync_date",
    "fieldtype": "Datetime",
-   "label": "Last Sync Date",
+   "label": "Last Good Run",
    "read_only": 1
   },
   {
@@ -368,13 +372,37 @@
    "fieldname": "skript_api_scope",
    "fieldtype": "Data",
    "label": "Skript API Scope"
+  },
+  {
+   "fieldname": "sync_started_on",
+   "fieldtype": "Datetime",
+   "label": "Run Started",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sync_report",
+   "fieldtype": "Long Text",
+   "label": "Last Run Report",
+   "read_only": 1
+  },
+  {
+   "fieldname": "skript_sync_started_on",
+   "fieldtype": "Datetime",
+   "label": "Skript Run Started",
+   "read_only": 1
+  },
+  {
+   "fieldname": "skript_sync_report",
+   "fieldtype": "Long Text",
+   "label": "Skript Last Run Report",
+   "read_only": 1
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2026-01-13 18:26:07.053876",
+ "modified": "2026-11-17 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "Bank Integration",
  "name": "Bank Integration Setting",

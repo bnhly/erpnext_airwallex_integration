@@ -1,284 +1,332 @@
+"""Airwallex bank feed: financial transactions into Bank Transaction.
+
+Rewritten 17 Nov 26 after lines went missing. What changed, and why:
+
+1. A line that failed to insert was logged and dropped: the run still said
+   "Completed" and the next run started after it. Now each line goes in on
+   its own savepoint, failures are kept in the run report, the run ends
+   "Completed with Errors", and the next window does not start after the
+   earliest failure (feed/common.py).
+2. Each run asked from the moment the last run FINISHED, so lines created
+   while a run was going, or that Airwallex lists late, were never asked
+   for. Now every run looks back LOOKBACK_DAYS; lines already in ERPNext are
+   skipped by transaction_id.
+3. Only the first page of the list was read. Now every page is.
+4. "In Progress" left by a run that died blocked every later run. Now a run
+   older than STALE_HOURS is taken over.
+5. The AUD and USD client rows share one login, so each fetched the same
+   lines and the USD row tried to insert every AUD line with no bank account
+   (refused once Bank Account became mandatory, which flooded Error Log).
+   Now ONE fetch per login, and each line goes to the row whose Bank
+   Account's ledger currency matches. Lines in a currency with no row
+   (GBP, EUR, SGD wallets) are counted, not inserted, not errors.
+6. "Sync old transactions" set the scheduled start point to now, skipping
+   everything since the last scheduled run. A manual or catch-up run no
+   longer moves the scheduled start point.
+"""
+
 import frappe
+from frappe.utils import get_datetime, now_datetime
+
+from bank_integration.airwallex.api.base_api import AirwallexAPIError
 from bank_integration.airwallex.api.financial_transactions import FinancialTransactions
-from bank_integration.airwallex.api.base_api import AirwallexAPIError  # Add this import
-from bank_integration.airwallex.utils import map_airwallex_to_erpnext, build_expense_merchant_index
+from bank_integration.airwallex.utils import build_expense_merchant_index, map_airwallex_to_erpnext
 from bank_integration.bank_integration.doctype.bank_integration_log import bank_integration_log as bi_log
-from datetime import datetime
-import traceback
+from bank_integration.feed import common
+
+STATUS_F = "sync_status"
+STARTED_F = "sync_started_on"
+REPORT_F = "sync_report"
+CURSOR_F = "last_sync_date"
+
+CARD_TYPES = ("CARD_PURCHASE", "CARD_REFUND")
 
 
-def sync_transactions(from_date, to_date, setting_name):
-    """Sync transactions for all configured clients"""
-    settings = frappe.get_doc("Bank Integration Setting", setting_name)
+# ------------------------------------------------------------------ routing
 
-    if not settings.airwallex_clients:
-        frappe.throw("No Airwallex clients configured")
+def client_routes(settings):
+    """Group the Airwallex Client rows by login and route by currency.
 
-    total_processed = 0
-    total_created = 0
-
-    # Convert datetime to ISO8601 format if needed
-    if hasattr(settings, '_to_iso8601'):
-        from_date_iso = settings._to_iso8601(from_date)
-        to_date_iso = settings._to_iso8601(to_date)
-    else:
-        # Fallback conversion
-        from frappe.utils import get_datetime
-        from_dt = get_datetime(from_date) if from_date else None
-        to_dt = get_datetime(to_date) if to_date else None
-        from_date_iso = from_dt.strftime('%Y-%m-%dT%H:%M:%SZ') if from_dt else None
-        to_date_iso = to_dt.strftime('%Y-%m-%dT%H:%M:%SZ') if to_dt else None
-
-    for client in settings.airwallex_clients:
-        try:
-            # Sync transactions for this specific client
-            processed, created = sync_client_transactions(
-                client, from_date_iso, to_date_iso, settings
+    Returns (logins, problems). logins = [{client_id, key_row, routes:
+    {currency: row}}]. problems = plain words about rows that cannot route.
+    """
+    logins = {}
+    problems = []
+    for row in settings.airwallex_clients or []:
+        cid = (row.airwallex_client_id or "").strip()
+        if not cid:
+            problems.append(f"Row {row.idx}: no client ID")
+            continue
+        login = logins.setdefault(cid, {"client_id": cid, "key_row": row, "routes": {}})
+        if not row.bank_account:
+            problems.append(f"Row {row.idx}: no Bank Account")
+            continue
+        account = frappe.db.get_value("Bank Account", row.bank_account, "account")
+        currency = frappe.db.get_value("Account", account, "account_currency") if account else None
+        if not account:
+            problems.append(f"Row {row.idx}: Bank Account {row.bank_account} has no ledger account")
+            continue
+        if not currency:
+            problems.append(f"Row {row.idx}: ledger account {account} has no Account Currency")
+            continue
+        if currency in login["routes"]:
+            first = login["routes"][currency]
+            problems.append(
+                f"Row {row.idx}: {currency} already goes to {first.bank_account} (row {first.idx}); ignored"
             )
-            total_processed += processed
-            total_created += created
+            continue
+        login["routes"][currency] = row
+    return list(logins.values()), problems
 
-        except Exception as e:
-            # Shorten the error message for the log title
-            client_short = client.airwallex_client_id[:8] if client.airwallex_client_id else "unknown"
-            error_title = f"Sync Error - Client {client_short}"
 
-            # Create detailed error message (truncated to avoid length issues)
-            error_message = f"Failed to sync transactions for client {client.airwallex_client_id}: {str(e)[:500]}"
+def _short(cid):
+    return (cid or "unknown")[:8]
 
-            frappe.log_error(message=error_message, title=error_title)
 
-            # Also log to Bank Integration Log
+# ------------------------------------------------------------------ core run
+
+def run_window(settings, from_dt, to_dt, dry_run=False, lookups=True, currencies=None):
+    """Fetch every line in [from_dt, to_dt] for every login and bring in
+    the ones ERPNext does not have.
+
+    dry_run: nothing is written; the report lists what would be added.
+    lookups: fetch counterparty / merchant names (off for dry runs).
+    currencies: only these currencies (catch-up); others are left alone.
+    Returns a report dict.
+    """
+    from_iso = settings._to_iso8601(from_dt)
+    to_iso = settings._to_iso8601(to_dt)
+    logins, problems = client_routes(settings)
+    if currencies:
+        keep = {c.upper() for c in currencies}
+        for login in logins:
+            login["routes"] = {c: r for c, r in login["routes"].items() if c in keep}
+    report = {
+        "window": [str(from_dt), str(to_dt)],
+        "dry_run": bool(dry_run),
+        "problems": problems,
+        "logins": [],
+        "failed": [],
+        "would_add": [],
+        "created": 0,
+    }
+
+    for login in logins:
+        row = login["key_row"]
+        part = {
+            "client": _short(login["client_id"]),
+            "routes": {cur: r.bank_account for cur, r in login["routes"].items()},
+            "fetched": 0,
+            "existing": 0,
+            "filtered": 0,
+            "created": 0,
+            "unrouted": {},
+            "failed": 0,
+        }
+        report["logins"].append(part)
+        if not login["routes"]:
+            continue
+        try:
+            api = FinancialTransactions(
+                client_id=login["client_id"],
+                api_key=row.get_password("airwallex_api_key"),
+                api_url=settings.api_url,
+            )
+            lines = list(api.iter_all(from_created_at=from_iso, to_created_at=to_iso))
+        except AirwallexAPIError as e:
+            part["error"] = f"Airwallex said: {str(e.message)[:300]}"
+            report["failed"].append({
+                "id": None, "when": str(from_dt), "reason": part["error"], "client": part["client"],
+            })
+            continue
+
+        part["fetched"] = len(lines)
+        have = common.existing_ids([t.get("id") for t in lines])
+        todo = []
+        for txn in lines:
+            if txn.get("id") in have:
+                part["existing"] += 1
+                continue
+            ttype = (txn.get("transaction_type") or "").upper()
+            if not settings.should_sync_transaction(ttype):
+                part["filtered"] += 1
+                continue
+            cur = (txn.get("currency") or "").upper()
+            if cur not in login["routes"]:
+                part["unrouted"][cur or "none"] = part["unrouted"].get(cur or "none", 0) + 1
+                continue
+            todo.append(txn)
+
+        # Merchant names only when there is a new card line to name.
+        expense_index = []
+        issuing_cache = {}
+        if lookups and not dry_run and any(t.get("source_type") in CARD_TYPES for t in todo):
+            expense_index = build_expense_merchant_index(row, settings.api_url, from_iso, to_iso)
+
+        for n, txn in enumerate(todo):
+            target = login["routes"][(txn.get("currency") or "").upper()]
+            fail = None
             try:
-                bi_log.create_log(
-                    f"Sync failed for client {client.airwallex_client_id}: {str(e)[:200]}",
-                    status="Error"
+                doc = map_airwallex_to_erpnext(
+                    txn,
+                    target.bank_account,
+                    client=target if (lookups and not dry_run) else None,
+                    api_url=settings.api_url,
+                    expense_index=expense_index,
+                    issuing_cache=issuing_cache,
                 )
-            except Exception as log_error:
-                frappe.logger().error(f"Failed to create integration log: {str(log_error)}")
+            except Exception as e:  # noqa: BLE001
+                doc, fail = None, common.clean_reason(e)
 
-    # After every sync, sweep recent Bank Transactions for any that
-    # still have an empty reference_number. Cardholders frequently
-    # review and fill in expense descriptions in Airwallex days after
-    # the underlying card swipe, so the row created by the original
-    # sync misses the data. A wider rolling window than the sync window
-    # catches those late edits.
+            if doc and not doc.get("bank_account"):
+                fail = f"No bank account for {txn.get('currency')} on {target.bank_account}"
+
+            if dry_run and not fail:
+                report["would_add"].append(_brief(txn, target.bank_account))
+                continue
+            if not fail:
+                name, fail = common.insert_line(doc, f"awx_line_{n}")
+                if name:
+                    part["created"] += 1
+                    report["created"] += 1
+                    if part["created"] % common.COMMIT_EVERY == 0:
+                        frappe.db.commit()
+                    continue
+            part["failed"] += 1
+            item = _brief(txn, target.bank_account)
+            item["reason"] = fail
+            item["client"] = part["client"]
+            report["failed"].append(item)
+
+    return report
+
+
+def _brief(txn, bank_account):
+    amount = txn.get("net")
+    if amount is None:
+        amount = txn.get("amount")
+    return {
+        "id": txn.get("id"),
+        "when": txn.get("created_at"),
+        "currency": txn.get("currency"),
+        "amount": amount,
+        "type": txn.get("transaction_type"),
+        "source": txn.get("source_type"),
+        "description": (txn.get("description") or "")[:120],
+        "bank_account": bank_account,
+    }
+
+
+def _finish(report, run, started, status):
+    report["run"] = run
+    report["started"] = str(started)
+    report["ended"] = str(now_datetime())
+    report["status"] = status
+    if common.has_field(REPORT_F):
+        common.save_report(REPORT_F, report)
+
+
+def _status_of(report):
+    return "Completed with Errors" if report["failed"] else "Completed"
+
+
+def _log_summary(run, report):
+    fails = len(report["failed"])
+    words = (
+        f"Airwallex {run}: {report['created']} added, {fails} failed, "
+        f"window {report['window'][0]} to {report['window'][1]}"
+    )
+    bi_log.create_log(words, status="Error" if fails else "Info")
+
+
+# ------------------------------------------------------------------ scheduled
+
+def sync_scheduled_transactions(setting_name=None, schedule_type=None):
+    """The scheduled run: window from the last good run less the look-back."""
+    settings = frappe.get_single(common.SETTINGS)
+    if not settings.is_enabled():
+        return
     try:
+        note = common.claim_lock(STATUS_F, STARTED_F, "Airwallex")
+    except common.FeedBusy as e:
+        frappe.logger("bank_integration").info(str(e))
+        return
+    if note:
+        bi_log.create_log(note, status="Error")
+
+    started = now_datetime()
+    status = "Failed"
+    try:
+        first_days = {"Hourly": 1, "Daily": 2, "Weekly": 8, "Monthly": 31}.get(schedule_type, 1)
+        from_dt = common.window_start(settings.get(CURSOR_F), first_days)
+        report = run_window(settings, from_dt, started)
+        status = _status_of(report)
+        cursor = common.next_cursor(started, report["failed"], settings.get(CURSOR_F))
+        common.set_single(CURSOR_F, cursor)
+        _finish(report, "scheduled", started, status)
+        _backfill_after(started)
+        if report["created"] or report["failed"]:
+            _log_summary("scheduled run", report)
+    except Exception:
+        frappe.db.rollback()
+        frappe.log_error(frappe.get_traceback(), "Airwallex scheduled sync failed")
+        status = "Failed"
+    finally:
+        common.release_lock(STATUS_F, status)
+
+
+# ------------------------------------------------------------------ manual / catch-up
+
+def sync_transactions(from_date, to_date, setting_name=None, run="sync old", **kwargs):
+    """A manual range (the "Sync old transactions" button, or catch-up).
+
+    Takes the same lock as the scheduled run. Never moves the scheduled
+    start point.
+    """
+    settings = frappe.get_single(common.SETTINGS)
+    try:
+        note = common.claim_lock(STATUS_F, STARTED_F, "Airwallex")
+    except common.FeedBusy as e:
+        bi_log.create_log(f"{run} not started: {e}", status="Error")
+        return {"busy": str(e)}
+    if note:
+        bi_log.create_log(note, status="Error")
+
+    started = now_datetime()
+    status = "Failed"
+    report = None
+    try:
+        report = run_window(settings, get_datetime(from_date), get_datetime(to_date))
+        status = _status_of(report)
+        _finish(report, run, started, status)
+        _backfill_after(get_datetime(to_date))
+        _log_summary(run, report)
+    except Exception:
+        frappe.db.rollback()
+        frappe.log_error(frappe.get_traceback(), f"Airwallex {run} failed")
+    finally:
+        common.release_lock(STATUS_F, status)
+    return report
+
+
+def _backfill_after(to_dt):
+    """Fill reference names that cardholders added late (unchanged rule)."""
+    try:
+        from frappe.utils import add_days, getdate
+
         from bank_integration.airwallex.backfill import backfill_reference_numbers
-        from frappe.utils import getdate, add_days, today
-        bf_to = getdate(to_date or today())
-        bf_from = add_days(bf_to, -60)
+
+        bf_to = getdate(to_dt)
         backfill_reference_numbers(
-            from_date=bf_from.isoformat(),
-            to_date=bf_to.isoformat(),
+            from_date=add_days(bf_to, -60).isoformat(), to_date=bf_to.isoformat()
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         frappe.log_error(
             message=f"Reference number backfill after sync failed: {str(e)[:400]}",
             title="AirW Sync Backfill Error",
         )
 
-    # Update final status and last sync date
-    settings.update_sync_progress(total_processed, total_processed, "Completed")
-    # Update last sync date to current time for successful completion
-    settings.db_set('last_sync_date', frappe.utils.now())
-
-
-def sync_client_transactions(client, from_date_iso, to_date_iso, settings):
-    """Sync transactions for a specific client"""
-    try:
-        # Initialize FinancialTransactions with proper credentials
-        api = FinancialTransactions(
-            client_id=client.airwallex_client_id,
-            api_key=client.get_password("airwallex_api_key"),
-            api_url=settings.api_url
-        )
-
-        # The API will automatically authenticate when needed
-        # Pass ISO8601 formatted dates to the API
-        transactions = api.get_list(from_created_at=from_date_iso, to_created_at=to_date_iso)
-        processed = 0
-        created = 0
-        skipped = 0
-
-        if not transactions:
-            return 0, 0
-
-        # Handle different response formats
-        if isinstance(transactions, dict):
-            # If the response is paginated or wrapped
-            transactions = transactions.get('items', transactions.get('data', []))
-
-        # Pull the Spend Expenses for the same window once, so we can match
-        # CARD_PURCHASE / CARD_REFUND rows to their merchant name without
-        # an API call per row. The Issuing Transactions API would be the
-        # cleaner source but it is gated on this client_id.
-        expense_index = build_expense_merchant_index(
-            client, settings.api_url, from_date_iso, to_date_iso
-        )
-        # Shared across the per-transaction loop so each Issuing
-        # transaction (the source of the clean merchant name on
-        # CARD_PURCHASE rows) is fetched at most once per sync.
-        issuing_cache = {}
-
-        for txn in transactions:
-            try:
-                transaction_id = txn.get('id')
-                transaction_type = txn.get('transaction_type', '').upper()
-                transaction_currency = txn.get('currency')
-
-                # Check if transaction already exists
-                if transaction_exists(transaction_id):
-                    frappe.logger().info(f"Transaction {transaction_id} already exists, skipping")
-                    processed += 1
-                    skipped += 1
-                    continue
-
-                # Check transaction type filtering
-                if not settings.should_sync_transaction(transaction_type):
-                    frappe.logger().info(f"Transaction {transaction_id} type '{transaction_type}' filtered out, skipping")
-                    processed += 1
-                    skipped += 1
-                    continue
-
-                # Check if transaction has currency (basic validation)
-                if not transaction_currency:
-                    frappe.logger().warning(f"Transaction {transaction_id} has no currency, skipping")
-                    processed += 1
-                    skipped += 1
-                    continue
-
-                # Map transaction to client's bank account
-                bank_txn = map_airwallex_to_erpnext(
-                    txn,
-                    client.bank_account,
-                    client=client,
-                    api_url=settings.api_url,
-                    expense_index=expense_index,
-                    issuing_cache=issuing_cache,
-                )
-                bank_txn_doc = frappe.get_doc(bank_txn)
-                bank_txn_doc.insert()
-                bank_txn_doc.submit()
-                created += 1
-
-                frappe.logger().info(f"Created transaction {transaction_id} of type {transaction_type}")
-
-                processed += 1
-
-                # Update progress periodically (every 10 transactions)
-                if processed % 10 == 0:
-                    settings.update_sync_progress(processed, len(transactions))
-
-            except Exception as txn_error:
-                client_short = client.airwallex_client_id[:8]
-                frappe.log_error(
-                    message=f"Failed to process transaction {txn.get('id', 'unknown')}: {str(txn_error)[:300]}",
-                    title=f"Txn Error - {client_short}"
-                )
-
-        # Final progress update
-        if hasattr(settings, 'update_sync_progress'):
-            settings.update_sync_progress(processed, len(transactions))
-
-        # Log summary
-        frappe.logger().info(f"Client {client.airwallex_client_id[:8]}: Processed {processed}, Created {created}, Skipped {skipped}")
-
-        return processed, created
-
-    except AirwallexAPIError as e:
-        client_short = client.airwallex_client_id[:8] if client.airwallex_client_id else "unknown"
-        frappe.log_error(
-            message=f"API Error for client {client.airwallex_client_id}: {str(e.message)[:300]}",
-            title=f"API Error - {client_short}"
-        )
-        return 0, 0
-
-    except Exception as e:
-        client_short = client.airwallex_client_id[:8] if client.airwallex_client_id else "unknown"
-        frappe.log_error(
-            message=f"Sync failed for client {client.airwallex_client_id}: {str(e)[:300]}",
-            title=f"Sync Error - {client_short}"
-        )
-        return 0, 0
-
 
 def transaction_exists(transaction_id):
-    """
-    Check if a Bank Transaction with the given transaction ID already exists
-    """
-    # Check using the transaction_id field
+    """True when a Bank Transaction carries this transaction_id."""
     return frappe.db.exists("Bank Transaction", {"transaction_id": transaction_id})
-
-
-def sync_scheduled_transactions(setting_name, schedule_type):
-    """
-    Sync transactions based on schedule type
-    """
-    from datetime import datetime, timedelta
-
-    try:
-        # For single doctype, use get_single instead of get_doc
-        setting = frappe.get_single("Bank Integration Setting")
-
-        # Check if sync is already in progress
-        if setting.sync_status == "In Progress":
-            frappe.logger().info(f"Sync already in progress, skipping {schedule_type} sync")
-            return
-
-        if not setting.is_enabled():
-            frappe.logger().info(f"Airwallex integration disabled")
-            return
-
-        # Set status to prevent concurrent runs
-        setting.db_set('sync_status', 'In Progress')
-
-        # Calculate date range based on schedule type
-        end_date = frappe.utils.now_datetime()
-
-        # Use last sync date as start date if available, otherwise use schedule-based calculation
-        if setting.last_sync_date:
-            start_date = frappe.utils.get_datetime(setting.last_sync_date)
-            frappe.logger().info(f"Using last sync date as start: {start_date}")
-        else:
-            # Fallback to schedule-based calculation for first run
-            if schedule_type == "Hourly":
-                # Sync last 2 hours
-                start_date = end_date - timedelta(hours=2)
-            elif schedule_type == "Daily":
-                # Sync yesterday
-                start_date = end_date - timedelta(days=1)
-            elif schedule_type == "Weekly":
-                # Sync last 7 days
-                start_date = end_date - timedelta(days=7)
-            elif schedule_type == "Monthly":
-                # Sync last 30 days
-                start_date = end_date - timedelta(days=30)
-            else:
-                frappe.logger().error(f"Unknown schedule type: {schedule_type}")
-                setting.db_set('sync_status', 'Failed')
-                return
-
-        bi_log.create_log(f"Starting scheduled {schedule_type} sync from {start_date} to {end_date}")
-        frappe.logger().info(f"Starting scheduled {schedule_type} sync from {start_date} to {end_date}")
-
-        # Use the existing sync function with calculated dates
-        # Pass the doctype name since it's a single doctype
-        sync_transactions(start_date, end_date, "Bank Integration Setting")
-
-        # Update last sync date on successful completion
-        setting.db_set('last_sync_date', frappe.utils.now())
-        frappe.logger().info(f"Scheduled {schedule_type} sync completed successfully")
-
-    except Exception as e:
-        # Make sure to reset status on error
-        try:
-            setting = frappe.get_single("Bank Integration Setting")
-            setting.db_set('sync_status', 'Failed')
-        except:
-            pass
-
-        error_msg = f"Scheduled {schedule_type} sync failed: {str(e)}"
-        bi_log.create_log(error_msg, status="Error")
-        frappe.log_error(frappe.get_traceback(), f"Scheduled Sync Error - {schedule_type}")
-        frappe.logger().error(error_msg)
