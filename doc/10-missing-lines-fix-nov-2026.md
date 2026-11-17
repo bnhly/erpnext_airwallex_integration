@@ -103,3 +103,16 @@ posting and unmapped accounts).
   tokens left in the old fields.
 - After deploy: open Airwallex Settings and Skript Settings once and check
   the values look right before the next hourly run.
+
+## Expense importer: Project from the job number (register E19, 17 Nov 2026)
+
+The Import Airwallex button now reads the job number in the cardholder's
+description ("0669", "TM-0622", "Tm 554", "job 671", "#0687") and sets
+Project on the draft invoice and its line when it names exactly one open
+project (not Completed or Cancelled; 0000 overhead and 0251 workshop count
+like any other job). No number, a number that is no open project, or two
+different jobs: Project stays blank for Kim, as before. A bare number must be
+four digits; after TM, job, project or # it may be shorter. Nothing else the
+importer makes has changed. If a site rule refuses the project, the invoice
+is made without it and the remarks say why. The import summary counts how
+many got a project. Check: `dev/check_expense_project_bench.py`.

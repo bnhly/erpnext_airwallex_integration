@@ -297,8 +297,9 @@ def run_expense_import(from_date=None, to_date=None):
     totals = {
         "scanned": 0, "created": 0, "duplicate": 0, "errors": 0,
         "attachments": 0, "skipped_wrong_status": 0, "skipped_by_tag": 0,
-        "deduped_cross_client": 0,
+        "deduped_cross_client": 0, "project_set": 0,
     }
+    projects = open_projects_by_job()
     # Each entry: {expense_id, date, amount, currency, card_name, description}
     skipped_tag_details = []
     # An Airwallex tenant returns the same Spend Expenses regardless of
@@ -383,8 +384,11 @@ def run_expense_import(from_date=None, to_date=None):
                         issuing_cache=issuing_cache,
                         client=client,
                         api_url=settings.api_url,
+                        projects=projects,
                     )
                     totals["created"] += 1
+                    if pi.get("project"):
+                        totals["project_set"] += 1
 
                     if IMPORT_ATTACHMENTS:
                         totals["attachments"] += attach_receipts(
@@ -414,7 +418,8 @@ def run_expense_import(from_date=None, to_date=None):
     # Plain text for the integration log (searchable, compact).
     log_summary = (
         f"Airwallex expense import complete. "
-        f"Scanned {totals['scanned']}, created {totals['created']} draft PIs, "
+        f"Scanned {totals['scanned']}, created {totals['created']} draft PIs "
+        f"({totals['project_set']} with a project from the description), "
         f"skipped {totals['duplicate']} already imported, "
         f"skipped {totals['skipped_by_tag']} by description tag, "
         f"skipped {totals['skipped_wrong_status']} wrong status, "
@@ -461,6 +466,7 @@ def _build_import_summary_html(totals, skipped_tag_details, from_date, to_date):
     #     showing rows that say "0" by default)
     summary_rows = [
         _row("Created draft Purchase Invoices", totals["created"], "text-success"),
+        _row("&nbsp;&nbsp;with a project from the description", totals.get("project_set", 0), "text-muted"),
         _row("Skipped &mdash; already imported", totals["duplicate"], "text-muted"),
         _row('Skipped &mdash; <code>#no_export</code> tag', totals["skipped_by_tag"], "text-muted"),
         _row("Attachments downloaded", totals["attachments"], "text-muted"),
@@ -542,14 +548,80 @@ def _build_import_summary_html(totals, skipped_tag_details, from_date, to_date):
 # ----------------------------------------------------------------------------
 # Invoice construction
 # ----------------------------------------------------------------------------
+# --------------------------------------------------------------- job numbers
+# Register E19 (Ben, 17 Nov 26). Cardholders usually put the job in the
+# description: "0669", "TM-0622", "Tm 554", "job 671". 0000 is overhead,
+# 0251 the workshop. The importer sets Project on the invoice and its line
+# when the description names exactly ONE job that is an open project (not
+# Completed or Cancelled). No number, a number that is no open project, or
+# two different jobs: Project is left blank for Kim, as before.
+
+import re as _re
+
+_JOB_TAGGED = _re.compile(r"(?:\bTM|\bjob|\bproject|#)[\s\-_:#]*0*(\d{1,4})(?!\d)", _re.I)
+_JOB_BARE = _re.compile(r"(?<![\d.,$/:-])(\d{4})(?![\d.,/:%])")
+_PROJECT_HEAD = _re.compile(r"^\s*(?:TM[\s\-_]*)?(\d{3,4})(?!\d)", _re.I)
+
+
+def job_numbers(text):
+    """Job numbers (4 digits, zero padded) named in a description, in order,
+    no repeats. A number after TM / job / project / # may be short ("Tm 554");
+    a bare number must be four digits ("0669")."""
+    if not text:
+        return []
+    found = []
+    for rx in (_JOB_TAGGED, _JOB_BARE):
+        for m in rx.finditer(text):
+            num = m.group(1).zfill(4)
+            if num not in found:
+                found.append(num)
+    return found
+
+
+def open_projects_by_job():
+    """{job number: [Project names]} for projects not Completed or Cancelled.
+
+    Raw SQL on purpose: a permission-checked list is cut down by the
+    importing user's User Permissions."""
+    out = {}
+    for name, title in frappe.db.sql(
+        """select name, ifnull(project_name, '') from `tabProject`
+           where ifnull(status, '') not in ('Completed', 'Cancelled')"""
+    ):
+        for text in (title, name):
+            m = _PROJECT_HEAD.match(text or "")
+            if m:
+                job = m.group(1).zfill(4)
+                if name not in out.setdefault(job, []):
+                    out[job].append(name)
+                break
+    return out
+
+
+def project_for_description(text, projects=None):
+    """The Project to set, or None. Exactly one job named in the text must
+    match exactly one open project."""
+    projects = open_projects_by_job() if projects is None else projects
+    hits = []
+    for job in job_numbers(text):
+        for name in projects.get(job, []):
+            if name not in hits:
+                hits.append(name)
+    return hits[0] if len(hits) == 1 else None
+
+
 def create_draft_invoice(
     expense,
     ft_index=None,
     issuing_cache=None,
     client=None,
     api_url=None,
+    projects=None,
 ):
     """Build and insert one draft Purchase Invoice for an expense.
+
+    ``projects`` is open_projects_by_job() for the run (read once); the
+    invoice and its line get the Project the description names, if any.
 
     ``ft_index`` / ``issuing_cache`` / ``client`` / ``api_url`` are optional
     and let the function look up the underlying Issuing transaction to get
@@ -636,12 +708,18 @@ def create_draft_invoice(
 
     pi.set_missing_values()
 
+    project = project_for_description(raw_description, projects)
+
     # Re-assert the defaults we want, in case supplier or item defaults changed them.
     for item in pi.items:
         item.expense_account = DEFAULT_EXPENSE_ACCOUNT
         item.cost_center = COST_CENTER
         if WAREHOUSE:
             item.warehouse = WAREHOUSE
+        if project:
+            item.project = project
+    if project:
+        pi.project = project
 
     # Exchange rate
     if billing_currency == company_currency:
@@ -666,7 +744,20 @@ def create_draft_invoice(
 
     pi.calculate_taxes_and_totals()
 
-    _insert_with_billno_fallback(pi, expense_id)
+    try:
+        _insert_with_billno_fallback(pi, expense_id)
+    except frappe.ValidationError as e:
+        if not project:
+            raise
+        # A site rule refused the project (for example a WBS it wants).
+        # Import it without one, as before E19, and say why in the remarks.
+        frappe.clear_messages()
+        pi.project = None
+        for item in pi.items:
+            item.project = None
+        reason = frappe.utils.strip_html(str(e))[:200]
+        pi.remarks = (pi.remarks or "") + f"\nProject {project} from the description was refused: {reason}"
+        _insert_with_billno_fallback(pi, expense_id)
     return pi
 
 
